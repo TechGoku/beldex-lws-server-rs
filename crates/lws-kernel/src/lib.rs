@@ -282,6 +282,42 @@ impl Batch {
         unsafe { ffi::lws_matches_free(out) };
         Ok(matches)
     }
+
+    /// Checks only the given `(tx index, key index)` pairs, e.g. a prefilter's
+    /// candidates. `Match::account` indexes into `keys`.
+    pub fn scan_pairs(&self, keys: &[ScanKey], pairs: &[(u32, u32)]) -> Result<Vec<Match>, Error> {
+        let mut accounts: Vec<ffi::lws_account> = keys
+            .iter()
+            .map(|k| ffi::lws_account {
+                view_secret: ffi::lws_key { data: k.view_secret },
+                spend_public: ffi::lws_key { data: k.spend_public },
+                scan_height: k.scan_height,
+            })
+            .collect();
+        let txs: Vec<u32> = pairs.iter().map(|p| p.0).collect();
+        let owners: Vec<u32> = pairs.iter().map(|p| p.1).collect();
+        let mut out: *mut ffi::lws_match = ptr::null_mut();
+        let mut count = 0usize;
+        let rc = unsafe {
+            ffi::lws_scan_pairs(
+                self.ptr.as_ptr(),
+                accounts.as_ptr(),
+                accounts.len(),
+                txs.as_ptr(),
+                owners.as_ptr(),
+                pairs.len(),
+                &mut out,
+                &mut count,
+            )
+        };
+        for a in &mut accounts {
+            zeroize::Zeroize::zeroize(&mut a.view_secret.data);
+        }
+        check(rc)?;
+        let matches = unsafe { slice(out, count) }.to_vec();
+        unsafe { ffi::lws_matches_free(out) };
+        Ok(matches)
+    }
 }
 
 impl Tx {

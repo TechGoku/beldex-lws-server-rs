@@ -119,7 +119,7 @@ async fn accounts_create_once() {
         assert_eq!(by_addr.view_key, ViewKey::new([201; 32]));
         assert!(store.account_by_address("nope").await.unwrap().is_none());
 
-        assert_eq!(store.set_status(&["address-1".into()], AccountStatus::Hidden).await.unwrap(), 1);
+        assert_eq!(store.set_status(&["address-1".into()], AccountStatus::Hidden).await.unwrap(), vec!["address-1"]);
         assert!(store.scan_targets(None).await.unwrap().is_empty());
     }
 }
@@ -231,7 +231,7 @@ async fn rescan_resets_one_account() {
             })
             .await
             .unwrap();
-        assert_eq!(store.rescan(&["address-1".into(), "missing".into()], 4).await.unwrap(), 1);
+        assert_eq!(store.rescan(&["address-1".into(), "missing".into()], 4).await.unwrap(), vec!["address-1"]);
         let a2 = store.account_by_id(a.id).await.unwrap().unwrap();
         assert_eq!((a2.start_height, a2.scan_height, a2.generation), (4, 4, 1));
         assert_eq!(store.outputs(a.id, 0).await.unwrap().len(), 1);

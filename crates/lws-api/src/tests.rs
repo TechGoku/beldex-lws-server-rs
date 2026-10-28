@@ -351,3 +351,72 @@ fn timestamp_unlocks_use_wall_clock() {
     o.unlock_time = MAX_BLOCK_NUMBER + 1; // 1985: long unlocked
     assert_eq!(wallet::tests_locked(&[o], &stakes, 10), 0);
 }
+
+/// The LMDB server's admin calls, unchanged, work against this server.
+#[tokio::test]
+async fn admin_api_is_compatible_with_the_lmdb_server() {
+    let h = harness(Config::default()).await;
+    let admin = wallet();
+    let (view_public, spend_public) = lws_kernel::decode_address(&admin.address, NET).unwrap();
+    h.state
+        .primary
+        .create_account(&lws_store::NewAccount {
+            address: admin.address.clone(),
+            view_public,
+            spend_public,
+            view_key: lws_core::ViewKey::from_hex(&admin.view_key).unwrap(),
+            status: AccountStatus::Hidden,
+            flags: lws_core::account_flags::ADMIN,
+            start_height: 0,
+        })
+        .await
+        .unwrap();
+    let auth = |params: Value| json!({"auth": admin.view_key, "params": params});
+
+    let (s, b) = call(&h.admin, "/list_accounts", auth(json!({})), None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["hidden"][0]["address"], admin.address);
+    assert!(b["hidden"][0].get("scan_height").is_some() && b["hidden"][0].get("access_time").is_some());
+    let stranger = wallet();
+    assert_eq!(
+        call(&h.admin, "/list_accounts", json!({"auth": stranger.view_key}), None).await.0,
+        StatusCode::FORBIDDEN
+    );
+
+    let user = wallet();
+    let (s, b) =
+        call(&h.admin, "/add_account", auth(json!({"address": user.address, "key": user.view_key})), None).await;
+    assert_eq!((s, b["updated"][0].as_str()), (StatusCode::OK, Some(user.address.as_str())));
+    let (_, b) =
+        call(&h.admin, "/rescan", auth(json!({"height": 5, "addresses": [user.address, "unknown"]})), None).await;
+    assert_eq!(b["updated"], json!([user.address]));
+    let (_, b) = call(
+        &h.admin,
+        "/modify_account_status",
+        auth(json!({"status": "inactive", "addresses": [user.address]})),
+        None,
+    )
+    .await;
+    assert_eq!(b["updated"], json!([user.address]));
+    let (_, b) =
+        call(&h.admin, "/reject_requests", auth(json!({"type": "import", "addresses": [user.address]})), None).await;
+    assert_eq!(b["updated"], json!([]));
+    let (_, b) = call(&h.admin, "/list_requests", auth(json!({})), None).await;
+    assert!(b.get("create").is_some() && b.get("import").is_some());
+
+    let (vp, sp) = lws_kernel::decode_address(&user.address, NET).unwrap();
+    let ok =
+        json!({"spend_public_hex": hex::encode(sp), "view_public_hex": hex::encode(vp), "view_key_hex": user.view_key});
+    let (_, b) = call(&h.admin, "/validate", auth(ok.clone()), None).await;
+    assert_eq!(b["address"], user.address);
+    let mut wrong = ok.clone();
+    wrong["view_key_hex"] = json!(stranger.view_key);
+    let (_, b) = call(&h.admin, "/validate", auth(wrong), None).await;
+    assert_eq!(b["error"]["field"], "view_key_hex");
+    let mut short = ok;
+    short["spend_public_hex"] = json!("abcd");
+    let (_, b) = call(&h.admin, "/validate", auth(short), None).await;
+    assert_eq!(b["error"]["details"], "Expected 64 characters");
+
+    assert_eq!(call(&h.admin, "/switch_db", auth(json!({"path": "/x"})), None).await.0, StatusCode::NOT_IMPLEMENTED);
+}

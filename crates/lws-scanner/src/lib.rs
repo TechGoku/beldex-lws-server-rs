@@ -6,8 +6,9 @@
 //! delays balance updates for everyone else. Lanes merge naturally as the
 //! slower ones catch up, because grouping is recomputed every pass.
 //!
-//! Within a lane, batches are pipelined: the next `get_blocks.bin` request is
-//! in flight while the current batch is scanned on the CPU pool and committed.
+//! Within a lane, block downloads run ahead of scanning: up to `fetch_window`
+//! requests are in flight at once, spread across every configured daemon, and
+//! their batches are applied strictly in height order while the CPU pool scans.
 //! Scanning a batch is split across all cores by account.
 //!
 //! Every commit is atomic and checked by the store against the chain epoch and
@@ -17,7 +18,7 @@
 //! account ids through a lease, and a standby takes over a shard when its
 //! holder stops renewing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -48,6 +49,8 @@ pub struct Config {
     pub max_lanes: usize,
     /// Batches a lane scans before lanes are regrouped.
     pub batches_per_pass: usize,
+    /// Block requests a lane keeps in flight at once, rotated across daemons.
+    pub fetch_window: usize,
     /// Accounts per kernel call; the unit of CPU parallelism.
     pub accounts_per_task: usize,
     /// Screen accounts with the fast Rust prefilter and run the kernel only
@@ -68,6 +71,7 @@ impl Default for Config {
             lane_window: 5_000,
             max_lanes: 4,
             batches_per_pass: 20,
+            fetch_window: 4,
             accounts_per_task: 256,
             fast_prefilter: true,
             lease_ttl: Duration::from_secs(30),
@@ -110,6 +114,92 @@ enum Fetched {
     Blocks(Blocks),
     /// The daemon has nothing at or after the requested height yet.
     AtTip,
+}
+
+/// Keeps several block requests in flight for one lane, each starting at a
+/// different daemon, and hands batches back strictly in height order.
+///
+/// Requests are speculative: the next one starts where the previous is
+/// expected to end, using the batch size the daemons have been returning.
+/// A short answer (the daemon capped it by size) leaves a gap, which is
+/// requested before anything after it is handed out; an answer that starts
+/// below the height asked for is dropped.
+struct Prefetcher {
+    daemon: Arc<Daemon>,
+    prune: bool,
+    lane: usize,
+    window: usize,
+    inflight: VecDeque<(u64, tokio::task::JoinHandle<anyhow::Result<Fetched>>)>,
+    next_issue: u64,
+    stride: u64,
+    tip: u64,
+    issued: usize,
+    budget: usize,
+}
+
+impl Prefetcher {
+    fn issue(&mut self, start: u64) -> tokio::task::JoinHandle<anyhow::Result<Fetched>> {
+        let request = GetBlocks { start_height: start, prune: self.prune, ..Default::default() };
+        let lane = self.lane + self.issued;
+        self.issued += 1;
+        self.budget = self.budget.saturating_sub(1);
+        tokio::spawn(Scanner::fetch(self.daemon.clone(), request, lane))
+    }
+
+    fn fill(&mut self) {
+        while self.inflight.len() < self.window && self.budget > 0 && self.next_issue < self.tip {
+            let start = self.next_issue;
+            let task = self.issue(start);
+            self.inflight.push_back((start, task));
+            self.next_issue += self.stride.max(1);
+        }
+    }
+
+    /// The batch starting exactly at `height`, or `None` when no daemon has it
+    /// yet or this pass's budget is spent.
+    async fn next(&mut self, height: u64) -> anyhow::Result<Option<Blocks>> {
+        while self.inflight.front().is_some_and(|(s, _)| *s < height) {
+            if let Some((_, task)) = self.inflight.pop_front() {
+                task.abort();
+            }
+        }
+        if self.inflight.front().is_none_or(|(s, _)| *s > height) {
+            if self.budget == 0 {
+                return Ok(None);
+            }
+            let task = self.issue(height);
+            self.inflight.push_front((height, task));
+        }
+        let (start, task) = self.inflight.pop_front().expect("a request for `height` was just ensured");
+        match task.await.context("fetch task")?? {
+            Fetched::AtTip => {
+                self.abort();
+                Ok(None)
+            }
+            Fetched::Blocks(blocks) => {
+                if blocks.start_height != start {
+                    bail!("daemon answered from height {}, asked for {start}", blocks.start_height);
+                }
+                self.tip = self.tip.max(blocks.current_height);
+                if blocks.blocks.is_empty() {
+                    return Ok(None);
+                }
+                let end = start + blocks.blocks.len() as u64;
+                if end < self.tip {
+                    self.stride = blocks.blocks.len() as u64;
+                }
+                self.next_issue = self.next_issue.max(end);
+                self.fill();
+                Ok(Some(blocks))
+            }
+        }
+    }
+
+    fn abort(&mut self) {
+        for (_, task) in self.inflight.drain(..) {
+            task.abort();
+        }
+    }
 }
 
 pub fn lease_name(shard: Option<(u32, u32)>) -> String {
@@ -194,6 +284,7 @@ impl Scanner {
         if !self.check_daemon(&mut shutdown).await? {
             return Ok(());
         }
+        self.daemon.refresh_heights().await;
         self.ensure_genesis().await?;
         let lease = lease_name(self.config.shard);
         let mut holding = false;
@@ -302,17 +393,22 @@ impl Scanner {
             GetBlocks { start_height: start, prune: self.config.prune, ..Default::default() }
         };
 
-        let mut pending = Some(tokio::spawn(Self::fetch(self.daemon.clone(), request, lane_no)));
+        let mut first_fetch = Some(tokio::spawn(Self::fetch(self.daemon.clone(), request, lane_no)));
+        let mut ahead: Option<Prefetcher> = None;
         let mut parent: Option<BlockId> = by_ids.then(|| sample[0]);
         let mut first = true;
         let mut progressed = false;
 
-        for batch_no in 0..self.config.batches_per_pass.max(1) {
-            let Some(task) = pending.take() else { break };
-            let blocks = match task.await.context("fetch task")?? {
-                Fetched::AtTip => break,
-                Fetched::Blocks(b) => b,
+        for _ in 0..self.config.batches_per_pass.max(1) {
+            let fetched = match (first_fetch.take(), ahead.as_mut(), parent) {
+                (Some(task), _, _) => match task.await.context("fetch task")?? {
+                    Fetched::AtTip => None,
+                    Fetched::Blocks(b) => Some(b),
+                },
+                (None, Some(pre), Some(p)) => pre.next(p.height + 1).await?,
+                _ => None,
             };
+            let Some(blocks) = fetched else { break };
             Metrics::set(&self.metrics.daemon_height, blocks.current_height);
 
             if first && by_ids && blocks.start_height < start {
@@ -342,10 +438,22 @@ impl Scanner {
                 break; // only the block we already have: at the tip
             }
 
-            // Pipeline: request the next batch before scanning this one.
-            if batch_last + 1 < blocks.current_height && batch_no + 1 < self.config.batches_per_pass {
-                let next = GetBlocks { start_height: batch_last + 1, prune: self.config.prune, ..Default::default() };
-                pending = Some(tokio::spawn(Self::fetch(self.daemon.clone(), next, lane_no)));
+            // Start downloading what follows before scanning this batch.
+            if ahead.is_none() {
+                let mut pre = Prefetcher {
+                    daemon: self.daemon.clone(),
+                    prune: self.config.prune,
+                    lane: lane_no,
+                    window: self.config.fetch_window.max(1),
+                    inflight: VecDeque::new(),
+                    next_issue: batch_last + 1,
+                    stride: blocks.blocks.len() as u64,
+                    tip: blocks.current_height,
+                    issued: 1,
+                    budget: self.config.batches_per_pass.saturating_sub(1),
+                };
+                pre.fill();
+                ahead = Some(pre);
             }
 
             let keys: Vec<ScanKey> = accounts
@@ -379,9 +487,14 @@ impl Scanner {
                 }
             }
 
+            let began = Instant::now();
             let commit = self.build_commit(epoch, &accounts, scanned).await?;
+            let build_ms = began.elapsed().as_millis() as u64;
             let found = (commit.outputs.len() as u64, commit.spends.len() as u64);
-            match self.store.commit_scan(&commit).await {
+            let began = Instant::now();
+            let committed = self.store.commit_scan(&commit).await;
+            debug!(build_ms, commit_ms = began.elapsed().as_millis() as u64, "batch db");
+            match committed {
                 Ok(report) => {
                     Metrics::add(&self.metrics.blocks_scanned_total, commit.blocks.len() as u64);
                     Metrics::add(&self.metrics.outputs_found_total, report.outputs);
@@ -424,8 +537,11 @@ impl Scanner {
                 break;
             }
         }
-        if let Some(task) = pending {
+        if let Some(task) = first_fetch {
             task.abort();
+        }
+        if let Some(mut pre) = ahead {
+            pre.abort();
         }
         Ok(progressed)
     }
@@ -523,26 +639,43 @@ fn scan_batch(
             output_indices: b.output_indices.clone(),
         })
         .collect();
+    let began = Instant::now();
     let batch = Batch::parse(&entries, pruned)?;
+    let parse_ms = began.elapsed().as_millis() as u64;
     let view = batch.view();
 
-    // Only accounts the prefilter flags go to the kernel, which decides.
-    let selected: Vec<usize> = if fast {
-        let flags = pool.install(|| lws_kernel::fast::candidates(&view, keys));
-        flags.iter().enumerate().filter(|(_, f)| **f).map(|(i, _)| i).collect()
+    // The prefilter screens every (tx, account) pair; the kernel verifies
+    // only the pairs it flags, so the cost of a hit is one check, not a
+    // rescan of the whole batch for that account.
+    let mut matches: Vec<lws_kernel::Match> = if fast {
+        let found = pool.install(|| lws_kernel::fast::candidates(&view, keys));
+        let mut matches: Vec<lws_kernel::Match> = pool
+            .install(|| {
+                found
+                    .pairs
+                    .par_chunks(per_task)
+                    .map(|chunk| batch.scan_pairs(keys, chunk))
+                    .collect::<Result<Vec<_>, _>>()
+            })?
+            .into_iter()
+            .flatten()
+            .collect();
+        if !found.full_scan.is_empty() {
+            let chosen: Vec<ScanKey> = found.full_scan.iter().map(|&i| keys[i].clone()).collect();
+            for mut m in batch.scan(&chosen)? {
+                m.account = found.full_scan[m.account as usize] as u32;
+                matches.push(m);
+            }
+        }
+        matches
     } else {
-        (0..keys.len()).collect()
-    };
-    let chosen: Vec<ScanKey> = selected.iter().map(|&i| keys[i].clone()).collect();
-    let mut matches: Vec<lws_kernel::Match> = pool
-        .install(|| {
-            chosen
-                .par_chunks(per_task)
+        pool.install(|| {
+            keys.par_chunks(per_task)
                 .enumerate()
                 .map(|(chunk, ks)| {
                     batch.scan(ks).map(|mut ms| {
                         for m in &mut ms {
-                            m.account = selected[chunk * per_task + m.account as usize] as u32;
+                            m.account += (chunk * per_task) as u32;
                         }
                         ms
                     })
@@ -551,8 +684,11 @@ fn scan_batch(
         })?
         .into_iter()
         .flatten()
-        .collect();
+        .collect()
+    };
     matches.sort_by_key(|m| (m.tx, m.output, m.account));
+    let scan_ms = began.elapsed().as_millis() as u64;
+    let began = Instant::now();
 
     let mut tx_block = vec![0usize; view.txs.len()];
     for (b, block) in view.blocks.iter().enumerate() {
@@ -625,6 +761,14 @@ fn scan_batch(
         }
     }
 
+    debug!(
+        blocks = view.blocks.len(),
+        parse_ms,
+        scan_ms,
+        collect_ms = began.elapsed().as_millis() as u64,
+        ring_members = ring_members.len(),
+        "batch cpu"
+    );
     let first_prev = view.blocks.first().map(|b| b.prev_hash.data).unwrap_or_default();
     let blocks_out = view.blocks.iter().map(|b| BlockId { height: b.height, hash: b.hash.data }).collect();
     Ok(Scanned { blocks: blocks_out, first_prev, outputs, ring_members })

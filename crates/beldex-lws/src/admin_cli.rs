@@ -92,6 +92,15 @@ pub enum AdminCommand {
         common: Common,
         file: PathBuf,
     },
+    /// Import accounts and pending requests straight from the LMDB server's
+    /// database directory (the one holding data.mdb), read-only. Each account
+    /// keeps its status, flags and start height and is rebuilt from the chain.
+    ImportLmdb {
+        #[command(flatten)]
+        common: Common,
+        /// The LMDB server's --db-path.
+        db_path: PathBuf,
+    },
     /// Re-encrypt every stored view key with the current sealing key.
     Reseal(Common),
 }
@@ -154,7 +163,9 @@ fn kind(name: &str) -> RequestKind {
 }
 
 async fn store(common: &Common) -> Result<Store> {
-    let store = open_store(&common.store, &common.store.database, 2).await?;
+    let mut args = common.store.clone();
+    args.resolve()?;
+    let store = open_store(&args, args.url(), 2).await?;
     store.check_network(common.network).await?;
     Ok(store)
 }
@@ -184,6 +195,51 @@ async fn add(
         start_height: start,
     };
     Ok(matches!(store.create_account(&new).await?, CreateOutcome::Created(_)))
+}
+
+/// Imports accounts and pending requests from an LMDB server database
+/// directory. Returns a one-line summary.
+pub async fn import_lmdb(s: &Store, network: Network, db_path: &std::path::Path) -> Result<String> {
+    let old = crate::legacy::read(db_path)?;
+    let (mut created, mut existing, mut invalid) = (0, 0, 0);
+    for a in &old.accounts {
+        if !lws_kernel::view_key_matches(&a.view_key, &a.view_public) {
+            invalid += 1;
+            continue;
+        }
+        let new = NewAccount {
+            address: lws_kernel::encode_address(&a.view_public, &a.spend_public, network),
+            view_public: a.view_public,
+            spend_public: a.spend_public,
+            view_key: ViewKey::new(*a.view_key),
+            status: a.status,
+            flags: i16::from(a.flags) & (account_flags::ADMIN | account_flags::GENERATED_LOCALLY),
+            start_height: a.start_height,
+        };
+        match s.create_account(&new).await? {
+            CreateOutcome::Created(_) => created += 1,
+            CreateOutcome::Exists(_) => existing += 1,
+        }
+    }
+    let mut requests = 0;
+    for r in &old.requests {
+        let request = lws_core::Request {
+            kind: if r.kind == 0 { RequestKind::Create } else { RequestKind::ImportScan },
+            address: lws_kernel::encode_address(&r.view_public, &r.spend_public, network),
+            view_public: r.view_public,
+            spend_public: r.spend_public,
+            view_key: ViewKey::new(*r.view_key),
+            start_height: r.start_height,
+            flags: i16::from(r.flags) & account_flags::GENERATED_LOCALLY,
+            created_at: i64::from(r.creation),
+        };
+        requests += usize::from(s.add_request(&request).await?);
+    }
+    let old_height = old.accounts.iter().map(|a| a.scan_height).max().unwrap_or(0);
+    Ok(format!(
+        "from {} (scanned to {old_height}): {created} account(s) imported, {existing} already present, {invalid} skipped (view key does not match); {requests} pending request(s) imported",
+        db_path.display()
+    ))
 }
 
 pub async fn run(cmd: AdminCommand) -> Result<()> {
@@ -229,16 +285,16 @@ pub async fn run(cmd: AdminCommand) -> Result<()> {
             println!("accepted {}", done.len());
         }
         AdminCommand::RejectRequests { common, kind: k, addresses } => {
-            let n = store(&common).await?.reject_requests(kind(&k), &addresses).await?;
+            let n = store(&common).await?.reject_requests(kind(&k), &addresses).await?.len();
             println!("rejected {n}");
         }
         AdminCommand::SetStatus { common, status, addresses } => {
             let status: AccountStatus = status.parse().map_err(anyhow::Error::msg)?;
-            let n = store(&common).await?.set_status(&addresses, status).await?;
+            let n = store(&common).await?.set_status(&addresses, status).await?.len();
             println!("updated {n}");
         }
         AdminCommand::Rescan { common, height, addresses } => {
-            let n = store(&common).await?.rescan(&addresses, height).await?;
+            let n = store(&common).await?.rescan(&addresses, height).await?.len();
             println!("rescanning {n} account(s) from {height}");
         }
         AdminCommand::Rollback { common, height, confirm } => {
@@ -294,6 +350,10 @@ pub async fn run(cmd: AdminCommand) -> Result<()> {
                     usize::from(add(&s, common.network, &r.address, &r.view_key, r.start_height, flags, status).await?);
             }
             println!("imported {created} of {} account(s); each is rebuilt from its start height", doc.accounts.len());
+        }
+        AdminCommand::ImportLmdb { common, db_path } => {
+            let s = store(&common).await?;
+            println!("{}", import_lmdb(&s, common.network, &db_path).await?);
         }
         AdminCommand::Reseal(c) => {
             if c.store.sealing_key_file.is_none() {

@@ -28,6 +28,30 @@ beldex-lws serve --role all --database sqlite:/var/lib/beldex-lws/lws.db ...
 - Changing the shard count is safe at any time. Shards are leased by name
   (`scanner-i-of-N`) and every commit is checked per account.
 
+## Several beldexd
+
+List every daemon in `--daemon` (comma-separated, primary first):
+
+```bash
+--daemon http://10.0.0.1:19091,http://10.0.0.2:19091,http://10.0.0.3:19091
+```
+
+- **Parallel downloads.** Each scan lane keeps `--fetch-window` block requests
+  in flight (by default twice the number of daemons, at most 8), each started
+  at a different daemon. Batches are applied strictly in height order and
+  checked block by block (each must extend the previous hash), so a daemon on
+  a different fork can only stall a batch, never corrupt one. This helps most
+  with remote daemons and full mainnet blocks, where downloading dominates.
+- **Failover.** A daemon that errors or times out is benched with exponential
+  backoff (up to 60 s) and requests move to the next. A benched daemon is still
+  tried as a last resort, so one recovering is noticed straight away.
+- **Lagging daemons.** Each daemon's chain height is tracked. A daemon more
+  than 5 blocks behind the best is tried after the others. A request for
+  blocks it does not have yet falls through to one that has them, instead of
+  being read as "nothing new".
+- `/health` on the admin listener shows each daemon's state, height and last
+  error.
+
 ## Configuration
 
 Every option has an environment variable (`LWS_*`, see `beldex-lws serve
@@ -119,15 +143,61 @@ The admin HTTP API offers the same operations (see [API.md](API.md)).
 
 ## Migrating from the LMDB server
 
-1. On the old server, run `beldex-lws-admin export_accounts accounts.json`.
-2. Here, run `beldex-lws admin import-accounts accounts.json`. The format is the
-   same; the network is checked.
-3. Point the wallets (or the load balancer) at the new server. The API is
-   unchanged.
+**Drop-in.** Install `beldex-lws` and point the old binary name at it:
 
-Accounts are rebuilt from the chain from their start heights. Run the new
-server alongside the old one until it reaches the tip
-(`beldex_lws_min_scan_height` in the metrics), then switch over.
+```bash
+ln -sf /opt/beldex-lws/bin/beldex-lws /usr/local/bin/beldex-lws-daemon
+```
+
+Invoked as `beldex-lws-daemon`, it implies `serve` and accepts the LMDB
+server's command line and `key=value` config file unchanged. On first start
+in the old `--db-path` it:
+
+1. creates its own SQLite database (`beldex-lws.sqlite`) and a sealing key
+   (`beldex-lws-seal.key`, mode 0600) in that directory;
+2. imports every account (status, flags, start height) and pending request
+   from the LMDB database there, read-only;
+3. rebuilds each account from the chain, from its start height.
+
+Wallets and the old admin tooling keep working: the wallet API, admin routes,
+admin-account authorisation and response shapes are the same.
+
+| LMDB server option | Here |
+| --- | --- |
+| `--rest-server http(s)://host:port` | `--listen` (+ TLS) |
+| `--rest-ssl-key`, `--rest-ssl-certificate` | `--tls-key`, `--tls-cert` |
+| `--admin-rest-server` | `--admin-listen` |
+| `--access-control-origin` | `--cors-origin` |
+| `--daemon`, `--daemon-backup` | `--daemon` (one list) |
+| `--scan-threads`, `--confirm-external-bind`, `--network`, `--config-file` | same |
+| `--rest-max-response-bytes`, `--rest-cache-bytes` | `--max-response-mb`, `--response-cache-mb` |
+| `--log-level 0-4` | same, or names (`info`, `debug`, ...) |
+| `--db-path` | SQLite and sealing key in that directory, plus the one-time import |
+| `--db-map-size`, `--db-max-readers`, `--create-queue-max`, `--daemon-spread`, `--sub`, `--rest-threads`, `--exchange-rate-interval` | accepted, no effect (noted at startup) |
+
+Differences to know about:
+
+- The admin API listens on `127.0.0.1:8444` by default. The LMDB server had
+  none unless `--admin-rest-server` was given. If the wallet API itself uses
+  port 8444, the admin API stays off until `--admin-listen` is passed.
+- A wrong view key is answered 403 and a malformed address 400, as the
+  lightwallet spec says. The LMDB server answered 500 for both.
+- `/switch_db` answers 501: rescans run in place, so there is nothing to
+  switch to.
+
+**Into PostgreSQL or another machine.** Import explicitly:
+
+```bash
+beldex-lws admin import-lmdb /var/lib/beldex-lws     # reads data.mdb read-only
+# or, from an export made with the old tool:
+beldex-lws admin import-accounts accounts.json
+```
+
+Read from a stopped server or from a `beldex-lws-backup` copy. The old server's
+LMDB lock format differs from this reader's, so it reads without locks.
+
+Either way, run the new server alongside the old one until it reaches the tip
+(`beldex_lws_min_scan_height` in the metrics), then switch the load balancer.
 
 ## Monitoring
 

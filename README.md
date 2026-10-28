@@ -32,6 +32,13 @@ REST API is the same, field for field, including privacy tokens (HF22) and
   - The admin API runs on its own listener and needs a bearer token.
   - Plain HTTP on a public address is refused.
 
+## Replacing the LMDB server
+
+Point `beldex-lws-daemon` at this binary and keep the existing command line,
+config file and `--db-path`. On first start it imports the old accounts and
+rebuilds them from the chain. Wallets and admin tools keep working. See
+[docs/OPERATIONS.md](docs/OPERATIONS.md#migrating-from-the-lmdb-server).
+
 ## Quick start (SQLite, testnet)
 
 ```bash

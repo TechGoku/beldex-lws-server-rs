@@ -106,4 +106,9 @@ if(LWS_KERNEL_TESTS)
   add_executable(lws_make_chain tests/make_chain.cpp)
   target_link_libraries(lws_make_chain PRIVATE beldex_core_libs)
   target_compile_features(lws_make_chain PRIVATE cxx_std_17)
+
+  # Prints the hash and prefix hash beldex core computes for a tx blob.
+  add_executable(lws_txinfo tests/txinfo.cpp)
+  target_link_libraries(lws_txinfo PRIVATE beldex_core_libs)
+  target_compile_features(lws_txinfo PRIVATE cxx_std_17)
 endif()

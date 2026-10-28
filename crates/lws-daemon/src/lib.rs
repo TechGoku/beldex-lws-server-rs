@@ -5,9 +5,15 @@
 //! benched endpoint is still tried as a last resort so a pool where everything
 //! is benched recovers on the first call that succeeds. One beldexd restart
 //! therefore costs a retry, not an outage.
+//!
+//! The pool also tracks each endpoint's chain height. Endpoints that have
+//! fallen behind the best one are tried after those at the tip, and a block
+//! request a lagging daemon cannot answer moves on to the next endpoint
+//! instead of reading as "nothing new".
 
 pub mod epee;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -45,7 +51,12 @@ struct Health {
 struct Endpoint {
     base: String,
     health: Mutex<Health>,
+    /// Highest chain height (block count) this endpoint has reported; 0 = unknown.
+    height: AtomicU64,
 }
+
+/// An endpoint this many blocks behind the best is tried after the others.
+const LAG_BLOCKS: u64 = 5;
 
 /// Point-in-time view of one endpoint, for `/health` and metrics.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -54,6 +65,8 @@ pub struct EndpointStatus {
     pub healthy: bool,
     pub consecutive_failures: u32,
     pub last_error: Option<String>,
+    /// Chain height last reported, if any.
+    pub height: Option<u64>,
 }
 
 pub struct Daemon {
@@ -140,7 +153,7 @@ impl Daemon {
         for url in urls {
             let base = normalize_url(url);
             if !endpoints.iter().any(|e| e.base == base) {
-                endpoints.push(Endpoint { base, health: Mutex::default() });
+                endpoints.push(Endpoint { base, health: Mutex::default(), height: AtomicU64::new(0) });
             }
         }
         Ok(Daemon { endpoints, http, rpc_timeout, blocks_timeout })
@@ -161,20 +174,36 @@ impl Daemon {
                     healthy: h.benched_until.is_none_or(|t| t <= now),
                     consecutive_failures: h.failures,
                     last_error: h.last_error.clone(),
+                    height: Some(e.height.load(Ordering::Relaxed)).filter(|&h| h != 0),
                 }
             })
             .collect()
     }
 
-    /// Endpoint indices to try: unbenched ones first, starting at `start`
-    /// (so scanner lanes can spread load), then benched ones.
+    /// The highest chain height any endpoint has reported.
+    pub fn best_height(&self) -> u64 {
+        self.endpoints.iter().map(|e| e.height.load(Ordering::Relaxed)).max().unwrap_or(0)
+    }
+
+    fn note_height(&self, index: usize, height: u64) {
+        self.endpoints[index].height.fetch_max(height, Ordering::Relaxed);
+    }
+
+    /// Endpoint indices to try, starting at `start` (so concurrent requests
+    /// spread across daemons): healthy endpoints at the chain tip, then
+    /// healthy ones that have fallen behind, then benched ones.
     fn order(&self, start: usize) -> Vec<usize> {
         let now = Instant::now();
         let n = self.endpoints.len();
+        let best = self.best_height();
         let rotated = (0..n).map(|i| (start + i) % n);
         let (healthy, benched): (Vec<usize>, Vec<usize>) =
             rotated.partition(|&i| self.endpoints[i].health.lock().unwrap().benched_until.is_none_or(|t| t <= now));
-        healthy.into_iter().chain(benched).collect()
+        let (current, lagging): (Vec<usize>, Vec<usize>) = healthy.into_iter().partition(|&i| {
+            let h = self.endpoints[i].height.load(Ordering::Relaxed);
+            h == 0 || h + LAG_BLOCKS >= best
+        });
+        current.into_iter().chain(lagging).chain(benched).collect()
     }
 
     fn record(&self, index: usize, outcome: std::result::Result<(), String>) {
@@ -191,6 +220,49 @@ impl Daemon {
         }
     }
 
+    /// One attempt against one endpoint; failures bench it.
+    async fn post_one(
+        &self,
+        index: usize,
+        path: &str,
+        body: &[u8],
+        content_type: &str,
+        timeout: Duration,
+    ) -> std::result::Result<Bytes, String> {
+        let url = format!("{}{}", self.endpoints[index].base, path);
+        let began = Instant::now();
+        let sent = self
+            .http
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .timeout(timeout)
+            .body(body.to_vec())
+            .send()
+            .await;
+        let outcome = match sent {
+            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                Ok(bytes) => Ok(bytes),
+                Err(e) => Err(format!("reading body: {e}")),
+            },
+            Ok(resp) => Err(format!("HTTP {}", resp.status())),
+            Err(e) if e.is_timeout() => Err(format!("timed out after {:?}", timeout)),
+            Err(e) => Err(e.to_string()),
+        };
+        match outcome {
+            Ok(bytes) => {
+                self.record(index, Ok(()));
+                debug!(%url, elapsed_ms = began.elapsed().as_millis() as u64, bytes = bytes.len(), "daemon call");
+                Ok(bytes)
+            }
+            Err(e) => {
+                self.record(index, Err(e.clone()));
+                Err(format!("{url}: {e}"))
+            }
+        }
+    }
+
+    /// Tries endpoints in [`Daemon::order`] until one answers. Returns the
+    /// body and the index of the endpoint that served it.
     async fn post(
         &self,
         start: usize,
@@ -198,38 +270,12 @@ impl Daemon {
         body: Vec<u8>,
         content_type: &str,
         timeout: Duration,
-    ) -> Result<Bytes> {
+    ) -> Result<(Bytes, usize)> {
         let mut last = String::new();
         for index in self.order(start) {
-            let url = format!("{}{}", self.endpoints[index].base, path);
-            let began = Instant::now();
-            let sent = self
-                .http
-                .post(&url)
-                .header(reqwest::header::CONTENT_TYPE, content_type)
-                .timeout(timeout)
-                .body(body.clone())
-                .send()
-                .await;
-            let outcome = match sent {
-                Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                    Ok(bytes) => Ok(bytes),
-                    Err(e) => Err(format!("reading body: {e}")),
-                },
-                Ok(resp) => Err(format!("HTTP {}", resp.status())),
-                Err(e) if e.is_timeout() => Err(format!("timed out after {:?}", timeout)),
-                Err(e) => Err(e.to_string()),
-            };
-            match outcome {
-                Ok(bytes) => {
-                    self.record(index, Ok(()));
-                    debug!(%url, elapsed_ms = began.elapsed().as_millis() as u64, bytes = bytes.len(), "daemon call");
-                    return Ok(bytes);
-                }
-                Err(e) => {
-                    last = format!("{url}: {e}");
-                    self.record(index, Err(e));
-                }
+            match self.post_one(index, path, &body, content_type, timeout).await {
+                Ok(bytes) => return Ok((bytes, index)),
+                Err(e) => last = e,
             }
         }
         Err(Error::Unavailable(last))
@@ -239,7 +285,11 @@ impl Daemon {
     pub async fn json_rpc(&self, method: &str, params: Json) -> Result<Json> {
         let body = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": "0", "method": method, "params": params}))
             .map_err(|e| Error::Decode(e.to_string()))?;
-        let bytes = self.post(0, "/json_rpc", body, "application/json", self.rpc_timeout).await?;
+        Ok(self.json_rpc_from(0, method, body).await?.0)
+    }
+
+    async fn json_rpc_from(&self, start: usize, method: &str, body: Vec<u8>) -> Result<(Json, usize)> {
+        let (bytes, index) = self.post(start, "/json_rpc", body, "application/json", self.rpc_timeout).await?;
         let envelope: Json = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Decode(format!("{method}: not JSON ({e}); is the daemon URL right?")))?;
         let mut envelope = unwrap_singletons(envelope);
@@ -250,16 +300,19 @@ impl Daemon {
             });
         }
         match envelope.get_mut("result") {
-            Some(result) => Ok(unwrap_singletons(result.take())),
+            Some(result) => Ok((unwrap_singletons(result.take()), index)),
             None => Err(Error::Decode(format!("{method}: response has no result"))),
         }
     }
 
     pub async fn get_info(&self) -> Result<Info> {
-        let r = self.json_rpc("get_info", json!({})).await?;
+        let body = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": "0", "method": "get_info", "params": {}}))
+            .map_err(|e| Error::Decode(e.to_string()))?;
+        let (r, index) = self.json_rpc_from(0, "get_info", body).await?;
         let u = |k: &str| r.get(k).and_then(Json::as_u64).unwrap_or(0);
         let height =
             r.get("height").and_then(Json::as_u64).ok_or_else(|| Error::Decode("get_info: no height".into()))?;
+        self.note_height(index, height);
         Ok(Info {
             height,
             target_height: u("target_height"),
@@ -281,7 +334,30 @@ impl Daemon {
         Ok(out)
     }
 
-    /// `get_blocks.bin`. `lane` picks which endpoint to try first.
+    /// Asks every endpoint for its height, so lagging daemons are known
+    /// before the first block request. Unreachable endpoints are benched.
+    pub async fn refresh_heights(&self) {
+        let body = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": "0", "method": "get_info", "params": {}}))
+            .unwrap_or_default();
+        let calls = (0..self.endpoints.len()).map(|i| {
+            let body = body.clone();
+            async move {
+                if let Ok(bytes) = self.post_one(i, "/json_rpc", &body, "application/json", self.rpc_timeout).await {
+                    if let Ok(v) = serde_json::from_slice::<Json>(&bytes) {
+                        if let Some(h) = unwrap_singletons(v).pointer("/result/height").and_then(Json::as_u64) {
+                            self.note_height(i, h);
+                        }
+                    }
+                }
+            }
+        });
+        futures::future::join_all(calls).await;
+    }
+
+    /// `get_blocks.bin`. `lane` picks which endpoint to try first, so
+    /// concurrent requests land on different daemons. An explicit-height
+    /// request that one daemon cannot answer (it is behind) is retried on the
+    /// others; the error is returned only when none can.
     pub async fn get_blocks(&self, request: &GetBlocks, lane: usize) -> Result<Blocks> {
         let mut ids = Vec::with_capacity(request.block_ids.len() * 32);
         request.block_ids.iter().for_each(|id| ids.extend_from_slice(id));
@@ -295,8 +371,36 @@ impl Daemon {
         root.insert("no_miner_tx", epee::Value::Bool(false));
         let body = epee::encode(&root);
 
-        let raw = self.post(lane, "/get_blocks.bin", body, "application/octet-stream", self.blocks_timeout).await?;
-        parse_blocks(raw)
+        let mut last: Option<Error> = None;
+        for index in self.order(lane) {
+            let raw = match self
+                .post_one(index, "/get_blocks.bin", &body, "application/octet-stream", self.blocks_timeout)
+                .await
+            {
+                Ok(raw) => raw,
+                Err(e) => {
+                    last = Some(Error::Unavailable(e));
+                    continue;
+                }
+            };
+            match parse_blocks(raw) {
+                Ok(blocks) => {
+                    self.note_height(index, blocks.current_height);
+                    return Ok(blocks);
+                }
+                Err(Error::Status(s)) if request.block_ids.is_empty() => {
+                    // This daemon does not have that height (yet).
+                    last = Some(Error::Status(s));
+                }
+                Err(Error::Status(s)) => return Err(Error::Status(s)),
+                Err(e) => {
+                    // A malformed answer: distrust this endpoint for a while.
+                    self.record(index, Err(e.to_string()));
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| Error::Unavailable("no daemon endpoints".into())))
     }
 
     pub async fn send_raw_transaction(&self, tx_hex: &str, flash: bool) -> Result<Json> {

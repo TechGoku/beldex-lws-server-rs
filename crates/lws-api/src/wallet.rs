@@ -618,7 +618,7 @@ pub async fn get_unspent_outs(State(state): State<Arc<AppState>>, body: Bytes) -
             returned += 1;
             last_height = o.height;
         }
-        if min_height == 0 && received.get() < req.amount.0 {
+        if min_height == 0 && received.exact() < u128::from(req.amount.0) {
             // The reference answers an unaffordable amount with 403.
             return Err(ApiError::Forbidden);
         }
@@ -917,13 +917,15 @@ pub async fn get_token_balances(State(state): State<Arc<AppState>>, body: Bytes)
                     sent.add(o.amount);
                 }
             }
-            let (received, sent, locked) = (received.get(), sent.get(), locked.get());
+            // Exact arithmetic first: the totals can exceed 64 bits on chains
+            // with very large token supplies even when the balance does not.
+            let unlocked = received.exact().saturating_sub(sent.exact() + locked.exact());
             let mut entry = TokenEntryJson {
                 token_id: id.clone(),
-                total_received: U64Str(received),
-                total_sent: U64Str(sent),
-                locked_funds: U64Str(locked),
-                unlocked_balance: U64Str(received.saturating_sub(sent.saturating_add(locked))),
+                total_received: U64Str(received.get()),
+                total_sent: U64Str(sent.get()),
+                locked_funds: U64Str(locked.get()),
+                unlocked_balance: U64Str(u64::try_from(unlocked).unwrap_or(u64::MAX)),
                 ..Default::default()
             };
             match st.daemon.token(&id).await {

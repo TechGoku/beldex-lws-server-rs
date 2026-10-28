@@ -6,6 +6,7 @@
 //! against one PostgreSQL database.
 
 mod admin_cli;
+mod legacy;
 mod settings;
 
 use std::net::SocketAddr;
@@ -176,17 +177,25 @@ async fn serve_http(
     Ok(())
 }
 
-async fn serve(args: ServeArgs) -> Result<()> {
+async fn serve(mut args: ServeArgs) -> Result<()> {
+    args.store.resolve()?;
     lws_kernel::self_check().context("scan kernel failed its self-check")?;
     args.validate()?;
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
     let pool_size = args.db_max_connections.unwrap_or((cores * 4).clamp(8, 64) as u32);
-    let primary = Arc::new(open_store(&args.store, &args.store.database, pool_size).await?);
+    let primary = Arc::new(open_store(&args.store, args.store.url(), pool_size).await?);
     if !args.no_migrate {
         primary.migrate().await.context("applying migrations")?;
     }
     primary.check_network(args.network).await?;
+    // Running in the LMDB server's directory: bring its accounts over once.
+    if let Some(dir) = &args.store.db_path {
+        if dir.join("data.mdb").exists() && primary.counts().await?.0 == 0 {
+            let summary = admin_cli::import_lmdb(&primary, args.network, dir).await?;
+            info!("imported the LMDB server's accounts: {summary}");
+        }
+    }
     let read = match &args.database_read {
         Some(url) => Arc::new(open_store(&args.store, url, pool_size).await?),
         None => primary.clone(),
@@ -214,6 +223,10 @@ async fn serve(args: ServeArgs) -> Result<()> {
             lane_window: args.lane_window,
             max_lanes: args.scan_lanes,
             batches_per_pass: 20,
+            fetch_window: match args.fetch_window {
+                0 => (2 * daemon.endpoint_count()).clamp(2, 8),
+                n => n,
+            },
             accounts_per_task: 256,
             fast_prefilter: !args.no_fast_scan,
             lease_ttl: Duration::from_secs(30),
@@ -247,12 +260,18 @@ async fn serve(args: ServeArgs) -> Result<()> {
         let token = match &args.admin_token_file {
             Some(path) => Some(read_secret_file(path)?.as_bytes().to_vec()),
             None => {
-                warn!("no --admin-token-file: admin routes are disabled (health, ready and metrics still served)");
+                info!("no --admin-token-file: admin routes accept only the LMDB server's admin-account auth");
                 None
             }
         };
-        let admin = lws_api::admin::admin_router(Arc::new(lws_api::admin::AdminState { app: state.clone(), token }));
-        tasks.spawn(serve_http("admin API", admin, args.admin_listen, None, stop_rx.clone()));
+        match args.admin_addr() {
+            Some(addr) => {
+                let admin =
+                    lws_api::admin::admin_router(Arc::new(lws_api::admin::AdminState { app: state.clone(), token }));
+                tasks.spawn(serve_http("admin API", admin, addr, None, stop_rx.clone()));
+            }
+            None => warn!("admin API off: the wallet API uses port 8444; pass --admin-listen to enable it"),
+        }
         let rx = stop_rx.clone();
         tasks.spawn(async move {
             lws_api::maintenance(state, rx).await;
@@ -281,14 +300,45 @@ async fn serve(args: ServeArgs) -> Result<()> {
     result
 }
 
+/// The process arguments. Invoked as `beldex-lws-daemon` (e.g. through a
+/// symlink installed in place of the LMDB server), `serve` is implied, so
+/// existing service files and scripts work unchanged.
+fn arguments() -> Vec<String> {
+    let mut args: Vec<String> = std::env::args().collect();
+    let invoked_as =
+        args.first().map(|a| std::path::Path::new(a).file_name().unwrap_or_default().to_string_lossy().into_owned());
+    if invoked_as.as_deref() == Some("beldex-lws-daemon") {
+        args.insert(1, "serve".into());
+    }
+    args
+}
+
+#[cfg(unix)]
+extern "C" {
+    fn umask(mask: u32) -> u32;
+}
+
 fn main() -> Result<()> {
+    // Everything this process creates (SQLite files, keys, exports) holds
+    // secrets or wallet history: owner-only, like the LMDB server's files.
+    #[cfg(unix)]
+    unsafe {
+        umask(0o077);
+    }
     settings::apply_config_file()?;
-    let cli = Cli::parse();
+    let mut cli = Cli::parse_from(arguments());
+    let mut notes = Vec::new();
+    if let Command::Serve(a) = &mut cli.command {
+        notes = a.apply_legacy()?;
+    }
     let (log_format, log_level) = match &cli.command {
         Command::Serve(a) => (a.log_format.clone(), a.log_level.clone()),
         _ => ("text".to_owned(), "info".to_owned()),
     };
     init_logging(&log_format, &log_level);
+    for note in notes {
+        warn!("{note}");
+    }
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let workers = match &cli.command {
@@ -305,8 +355,9 @@ fn main() -> Result<()> {
     runtime.block_on(async move {
         match cli.command {
             Command::Serve(args) => serve(*args).await,
-            Command::Migrate(args) => {
-                let store = open_store(&args, &args.database, 2).await?;
+            Command::Migrate(mut args) => {
+                args.resolve()?;
+                let store = open_store(&args, args.url(), 2).await?;
                 store.migrate().await?;
                 info!(backend = store.backend(), "migrations applied");
                 Ok(())

@@ -22,6 +22,7 @@ axum.workspace = true
 axum-server.workspace = true
 clap.workspace = true
 hex.workspace = true
+lmdb-rkv.workspace = true
 rand.workspace = true
 rustls.workspace = true
 serde.workspace = true

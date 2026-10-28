@@ -30,6 +30,7 @@ struct lws_batch
   std::vector<lws_input> inputs;
   std::vector<lws_output> outputs;
   std::vector<uint64_t> ring_members;
+  std::vector<uint64_t> tx_height; // height of the block holding each tx
   // Parsed transactions are kept for scanning: rct ecdh data and token
   // ciphertexts are needed only for outputs that turn out to be owned.
   std::vector<cryptonote::transaction> parsed;
@@ -264,6 +265,7 @@ namespace
     }
 
     out.tx_count = checked_u32(batch.txs.size() - out.tx_offset);
+    batch.tx_height.resize(batch.txs.size(), out.height);
     batch.blocks.push_back(out);
     return LWS_OK;
   }
@@ -540,6 +542,37 @@ int lws_scan(const lws_batch* batch, const lws_account* accounts, size_t account
 void lws_matches_free(lws_match* matches)
 {
   delete[] matches;
+}
+
+int lws_scan_pairs(const lws_batch* batch, const lws_account* accounts, size_t account_count,
+                   const uint32_t* pair_tx, const uint32_t* pair_account, size_t pair_count,
+                   lws_match** out, size_t* out_count)
+{
+  if (!batch || !out || !out_count || (pair_count && (!pair_tx || !pair_account || !accounts)))
+    return fail(LWS_ERR_ARGUMENT, "null argument");
+  *out = nullptr;
+  *out_count = 0;
+  return guarded([&] {
+    std::vector<lws_match> matches;
+    for (std::size_t i = 0; i < pair_count; ++i)
+    {
+      const uint32_t tx = pair_tx[i];
+      const uint32_t account = pair_account[i];
+      if (batch->txs.size() <= tx || account_count <= account)
+        return fail(LWS_ERR_ARGUMENT, "pair out of range");
+      const std::size_t before = matches.size();
+      scan_tx(*batch, tx, &accounts[account], 1, batch->tx_height[tx], matches);
+      for (std::size_t m = before; m < matches.size(); ++m)
+        matches[m].account = account;
+    }
+    if (matches.empty())
+      return LWS_OK;
+    auto* buffer = new lws_match[matches.size()];
+    std::copy(matches.begin(), matches.end(), buffer);
+    *out = buffer;
+    *out_count = matches.size();
+    return LWS_OK;
+  });
 }
 
 int lws_address_decode(const char* address, size_t len, uint8_t network,

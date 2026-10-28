@@ -1,13 +1,20 @@
 //! The admin and operations API. Served on its own listener, which should be
-//! bound to loopback or a private network. Every route except `/health`,
-//! `/ready` and `/metrics` requires `Authorization: Bearer <token>`; the token
-//! is compared in constant time and never logged.
+//! bound to loopback or a private network.
 //!
-//! Bodies are JSON. For compatibility with the reference server's admin
-//! calls, parameters may be wrapped as `{"params": {...}}`.
+//! Routes, request bodies and responses match the LMDB server's admin API, so
+//! its tooling keeps working. Every route except `/health`, `/ready` and
+//! `/metrics` must be authorised in one of two ways:
+//!
+//! * `Authorization: Bearer <token>` (the `--admin-token-file` contents), or
+//! * the LMDB server's form: `{"auth": "<view key of an admin account>",
+//!   "params": {...}}`, where the account is flagged admin and not inactive.
+//!
+//! Both are compared in constant time and never logged. A missing or wrong
+//! bearer token is 401; a wrong `auth` key is 403, as before.
 
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
@@ -28,25 +35,53 @@ use crate::{json_bytes, json_response, AppState};
 
 pub struct AdminState {
     pub app: Arc<AppState>,
-    /// SHA-free constant-time comparison works on the raw token bytes.
+    /// Bearer token; `None` disables bearer authorisation.
     pub token: Option<Vec<u8>>,
 }
 
+const MAX_ADMIN_BODY: usize = 1024 * 1024;
+
+/// Whether `key` is the view key of an active or hidden admin account.
+async fn admin_key_ok(state: &AdminState, key: &str) -> bool {
+    let Some(key) = hex32(key) else { return false };
+    let Ok(view_public) = lws_kernel::secret_to_public(&key) else { return false };
+    let Ok(admins) = state.app.primary.admin_accounts().await else { return false };
+    admins.iter().any(|a| {
+        a.status != AccountStatus::Inactive
+            && a.view_public == view_public
+            && bool::from(a.view_key.bytes().ct_eq(&key))
+    })
+}
+
 async fn authorize(State(state): State<Arc<AdminState>>, req: Request, next: Next) -> Response {
-    let presented = req
-        .headers()
+    let (parts, body) = req.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_ADMIN_BODY).await else {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large").into_response();
+    };
+    let bearer = parts
+        .headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::as_bytes);
-    let ok = match (&state.token, presented) {
+    let allowed = match (&state.token, bearer) {
         (Some(expected), Some(given)) => expected.len() == given.len() && bool::from(expected.as_slice().ct_eq(given)),
-        _ => false,
+        (_, Some(_)) => false,
+        (_, None) => {
+            let auth = serde_json::from_slice::<Json>(&bytes)
+                .ok()
+                .and_then(|v| v.get("auth").and_then(Json::as_str).map(str::to_owned));
+            match auth {
+                Some(key) if admin_key_ok(&state, &key).await => true,
+                Some(_) => return (StatusCode::FORBIDDEN, "Forbidden").into_response(),
+                None => false,
+            }
+        }
     };
-    if !ok {
+    if !allowed {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
-    next.run(req).await
+    next.run(Request::from_parts(parts, Body::from(bytes))).await
 }
 
 fn params<T: for<'de> Deserialize<'de>>(body: &Bytes) -> ApiResult<T> {
@@ -136,7 +171,8 @@ async fn add_account(State(s): State<Arc<AdminState>>, body: Bytes) -> ApiResult
     };
     let created = matches!(s.app.primary.create_account(&new).await?, CreateOutcome::Created(_));
     info!(address = %new.address, created, start_height, "admin add_account");
-    Ok(json_response(json_bytes(&s.app, &json!({"created": created, "start_height": start_height}))?))
+    let updated: Vec<&str> = if created { vec![new.address.as_str()] } else { vec![] };
+    Ok(json_response(json_bytes(&s.app, &json!({"updated": updated}))?))
 }
 
 #[derive(Deserialize)]
@@ -156,7 +192,7 @@ async fn accept_requests(State(s): State<Arc<AdminState>>, body: Bytes) -> ApiRe
 async fn reject_requests(State(s): State<Arc<AdminState>>, body: Bytes) -> ApiResult<Response> {
     let p: Requests = params(&body)?;
     let removed = s.app.primary.reject_requests(kind_of(&p.kind)?, &p.addresses).await?;
-    Ok(json_response(json_bytes(&s.app, &json!({"removed": removed}))?))
+    Ok(json_response(json_bytes(&s.app, &json!({"updated": removed}))?))
 }
 
 #[derive(Deserialize)]
@@ -169,7 +205,7 @@ async fn modify_account_status(State(s): State<Arc<AdminState>>, body: Bytes) ->
     let p: ModifyStatus = params(&body)?;
     let status: AccountStatus = p.status.parse().map_err(ApiError::BadRequest)?;
     let updated = s.app.primary.set_status(&p.addresses, status).await?;
-    info!(updated, status = %p.status, "admin modified account status");
+    info!(updated = updated.len(), status = %p.status, "admin modified account status");
     Ok(json_response(json_bytes(&s.app, &json!({"updated": updated}))?))
 }
 
@@ -182,8 +218,52 @@ struct Rescan {
 async fn rescan(State(s): State<Arc<AdminState>>, body: Bytes) -> ApiResult<Response> {
     let p: Rescan = params(&body)?;
     let updated = s.app.primary.rescan(&p.addresses, p.height).await?;
-    info!(updated, height = p.height, "admin rescan");
+    info!(updated = updated.len(), height = p.height, "admin rescan");
     Ok(json_response(json_bytes(&s.app, &json!({"updated": updated}))?))
+}
+
+#[derive(Deserialize)]
+struct Validate {
+    spend_public_hex: String,
+    view_public_hex: String,
+    view_key_hex: String,
+}
+
+/// Checks a key set the way the LMDB server did: `{"address": ...}` when the
+/// keys form a valid account, otherwise `{"error": {"field", "details"}}`.
+async fn validate(State(s): State<Arc<AdminState>>, body: Bytes) -> ApiResult<Response> {
+    let p: Validate = params(&body)?;
+    let error = |field: &str, details: &str| json!({"error": {"field": field, "details": details}});
+    let decode = |field: &str, text: &str| -> Result<[u8; 32], Json> {
+        if text.len() != 64 {
+            return Err(error(field, "Expected 64 characters"));
+        }
+        hex32(text).ok_or_else(|| error(field, "Invalid hex"))
+    };
+    let result = (|| -> Result<Json, Json> {
+        let spend = decode("spend_public_hex", &p.spend_public_hex)?;
+        let view = decode("view_public_hex", &p.view_public_hex)?;
+        let key = decode("view_key_hex", &p.view_key_hex)?;
+        if !lws_kernel::fast::is_point(&spend) {
+            return Err(error("spend_public_hex", "Invalid public key format"));
+        }
+        if !lws_kernel::fast::is_point(&view) {
+            return Err(error("view_public_hex", "Invalid public key format"));
+        }
+        if !lws_kernel::view_key_matches(&key, &view) {
+            return Err(error("view_key_hex", "view_key and view_public do not match"));
+        }
+        Ok(json!({"address": lws_kernel::encode_address(&view, &spend, s.app.config.network)}))
+    })();
+    let body = result.unwrap_or_else(|e| e);
+    Ok(json_response(json_bytes(&s.app, &body)?))
+}
+
+/// The LMDB server swapped in a rebuilt database here. Rescans run in place
+/// in this server, so there is nothing to switch to.
+async fn switch_db() -> Response {
+    let body = json!({"error": "switch_db is not needed: rescans and rollbacks run in place while the server keeps serving; use /rescan"});
+    (StatusCode::NOT_IMPLEMENTED, [(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
 }
 
 async fn metrics(State(s): State<Arc<AdminState>>) -> Response {
@@ -228,6 +308,8 @@ pub fn admin_router(state: Arc<AdminState>) -> Router {
         .route("/reject_requests", post(reject_requests))
         .route("/modify_account_status", post(modify_account_status))
         .route("/rescan", post(rescan))
+        .route("/validate", post(validate))
+        .route("/switch_db", post(switch_db))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize))
         .layer(DefaultBodyLimit::max(1024 * 1024));
     Router::new()

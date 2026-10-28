@@ -45,8 +45,8 @@ Wallets confirm spends with their own key images.
 | Code | Meaning |
 | --- | --- |
 | 200 | OK |
-| 400 | Malformed request, bad address, unknown token |
-| 403 | Unknown, hidden or unapproved account; wrong view key; `get_unspent_outs` amount above the balance |
+| 400 | Malformed request, bad address (the LMDB server answered 500), unknown token |
+| 403 | Unknown, hidden or unapproved account; wrong view key (the LMDB server answered 500); `get_unspent_outs` amount above the balance |
 | 404 | No such method |
 | 405 | Not POST |
 | 429 | Rate limited (`Retry-After`) |
@@ -55,19 +55,30 @@ Wallets confirm spends with their own key images.
 
 ## Admin API
 
-This API runs on `--admin-listen`. Protected routes need
-`Authorization: Bearer <contents of --admin-token-file>`, and take a JSON body
-that may be wrapped as `{"params": {...}}`.
+This runs on `--admin-listen`. Routes, bodies and responses are those of the
+LMDB server's admin API, so its scripts and tools keep working. Protected
+routes accept either form of authorisation:
 
-| Route | Body | |
+- `Authorization: Bearer <contents of --admin-token-file>`, or
+- the LMDB server's body form: `{"auth": "<view key of an admin account>",
+  "params": {...}}`. The account must be flagged admin
+  (`admin add-account` / `/add_account` with `"admin": true`) and not inactive.
+
+A missing or wrong bearer token gives 401; a wrong `auth` key gives 403.
+
+| Route | `params` | Response |
 | --- | --- | --- |
-| `POST /list_accounts` | none | `{active, inactive, hidden}` |
-| `POST /list_requests` | none | `{create, import}` |
-| `POST /add_account` | `address`, `key`, `start_height?`, `admin?` | |
-| `POST /accept_requests` | `type` (`create`/`import`), `addresses` | |
-| `POST /reject_requests` | `type`, `addresses` | |
-| `POST /modify_account_status` | `status`, `addresses` | |
-| `POST /rescan` | `height`, `addresses` | |
-| `GET /metrics` | none | Prometheus text, no auth |
-| `GET /health` | none | Details, no auth |
-| `GET /ready` | none | 200 or 503, no auth |
+| `POST /list_accounts` | none | `{active, inactive, hidden}`: arrays of `{address, scan_height, access_time, ...}` |
+| `POST /list_requests` | none | `{create, import}`: arrays of `{address, start_height, ...}` |
+| `POST /add_account` | `address`, `key` (`start_height?`, `admin?`) | `{updated: [address]}` |
+| `POST /accept_requests` | `type` (`create`/`import`), `addresses` | `{updated: [...]}` |
+| `POST /reject_requests` | `type`, `addresses` | `{updated: [...]}` |
+| `POST /modify_account_status` | `status` (`active`/`inactive`/`hidden`), `addresses` | `{updated: [...]}` |
+| `POST /rescan` | `height`, `addresses` | `{updated: [...]}` |
+| `POST /validate` | `spend_public_hex`, `view_public_hex`, `view_key_hex` | `{address}` or `{error: {field, details}}` |
+| `POST /switch_db` | | 501: not needed; rescans run in place |
+| `GET /metrics` | | Prometheus text, no auth |
+| `GET /health` | | Details, no auth |
+| `GET /ready` | | 200 or 503, no auth |
+
+`updated` lists the addresses that were changed. Unknown addresses are left out.

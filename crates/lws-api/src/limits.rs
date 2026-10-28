@@ -76,8 +76,13 @@ impl RateLimiter {
 
     /// Drops buckets that have been idle long enough to be full again.
     pub fn sweep(&self) {
-        let full_after =
-            Duration::from_secs_f64(self.burst / self.rate.max(f64::MIN_POSITIVE)).min(Duration::from_secs(3600));
+        if !self.enabled() {
+            return;
+        }
+        // A bucket idle for burst/rate seconds has refilled; cap at an hour.
+        let full_after = Duration::try_from_secs_f64(self.burst / self.rate)
+            .unwrap_or(Duration::from_secs(3600))
+            .min(Duration::from_secs(3600));
         let now = Instant::now();
         for shard in &self.shards {
             shard.lock().unwrap().retain(|_, b| now.duration_since(b.last) < full_after);
@@ -116,6 +121,16 @@ mod tests {
         assert_ne!(ClientKey::from(a), ClientKey::from(c));
         let mapped: IpAddr = "::ffff:10.0.0.1".parse().unwrap();
         assert_eq!(ClientKey::from(mapped), ClientKey::from("10.0.0.1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn disabled_limiter_never_refuses_or_panics() {
+        let l = RateLimiter::new(0.0, 60.0);
+        for _ in 0..1000 {
+            assert!(l.check(ClientKey(9), 1.0).is_ok());
+        }
+        l.sweep();
+        RateLimiter::new(1e-300, 1e300).sweep();
     }
 
     #[test]

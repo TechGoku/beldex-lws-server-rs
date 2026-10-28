@@ -4,7 +4,7 @@
 
 use std::ffi::c_char;
 
-pub const LWS_KERNEL_ABI_VERSION: u32 = 3;
+pub const LWS_KERNEL_ABI_VERSION: u32 = 4;
 
 pub const LWS_OK: i32 = 0;
 pub const LWS_ERR_ARGUMENT: i32 = 1;
@@ -203,6 +203,16 @@ extern "C" {
         out_count: *mut usize,
     ) -> i32;
     pub fn lws_matches_free(matches: *mut lws_match);
+    pub fn lws_scan_pairs(
+        batch: *const lws_batch,
+        accounts: *const lws_account,
+        account_count: usize,
+        pair_tx: *const u32,
+        pair_account: *const u32,
+        pair_count: usize,
+        out: *mut *mut lws_match,
+        out_count: *mut usize,
+    ) -> i32;
     pub fn lws_address_decode(
         address: *const c_char,
         len: usize,

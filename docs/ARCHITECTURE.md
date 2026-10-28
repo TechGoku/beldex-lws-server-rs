@@ -56,9 +56,15 @@ curve25519-dalek. It builds one precomputed table per transaction public key
 and shares it across all accounts, which turns the per-account variable-base
 multiplication into a fixed-base one.
 
-The prefilter only screens. Accounts it flags are rescanned by the kernel,
-which alone decides ownership and decodes amounts. Its tests check it against
+The prefilter only screens. It reports (transaction, account) pairs, and the
+kernel verifies exactly those pairs (`lws_scan_pairs`), so a hit costs one
+kernel check, not a rescan of the batch for that account. The kernel alone
+decides ownership and decodes amounts. The prefilter's tests check it against
 the kernel's own key derivation on random keys.
+
+Work is split into (transaction, block of 64 accounts) items, so every core is
+busy whether a batch holds many transactions and few accounts (catching up)
+or one transaction and millions of accounts (at the tip).
 
 Measured on the development machine (12 threads), per account-transaction check:
 
@@ -79,8 +85,11 @@ scans only `id % count == index`.
   which holds nearly every account, plus the furthest-behind lanes in
   parallel, so a wallet importing from genesis never slows balance updates for
   everyone else. Lanes are regrouped every pass and merge as they catch up.
-- **Pipelining.** The next block request is in flight while the current batch
-  is parsed and scanned on the CPU pool.
+- **Parallel fetching.** Up to `--fetch-window` block requests are in flight per
+  lane, rotated across every `--daemon`, while the current batch is scanned.
+  The batch size is learned from the daemons; gaps are filled and overlaps
+  dropped, and batches are applied in height order with hash-chain checks
+  between them. Daemons that are behind the tip are tried last.
 - **Reorgs.** Each block request carries a sparse list of our block hashes:
   ten dense, then exponentially further back, ending with genesis. Stock
   `beldexd` answers from the highest one still on its chain, so a fork is
@@ -133,6 +142,19 @@ costs one computation per block, not one per poll. Daemon data (stakes, fees,
 fork version, output distribution, token descriptors) is cached with a TTL,
 refreshed by a single caller, and served stale for up to two minutes if
 `beldexd` is briefly unavailable.
+
+## Verified against a live chain
+
+On the private `testnet5` (124,876 blocks, fork 22, privacy tokens), compared
+with wallet2 as ground truth and with the LMDB server:
+
+| | LMDB server | beldex-lws |
+| --- | --- | --- |
+| Unlocked outputs found (wallets A, T) | 32/49, 139/142 | 49/49, 142/142 |
+| Real spends among candidates (A, T) | 6/10, 83/113 | 10/10, 113/113 |
+| `tx_prefix_hash` of token txs (46 txs) | 0 correct | 46 correct (checked with beldex core) |
+| Token balances (wallets C, Ext, A) | same as beldex-lws | same as LMDB server |
+| Full scan from genesis, 4 wallets | | 9.7 s (12 threads, PostgreSQL) |
 
 ## Security model
 

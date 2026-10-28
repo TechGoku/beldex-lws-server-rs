@@ -4,6 +4,7 @@
 //! Then the daemon switches to a competing fork and the server must roll the
 //! abandoned blocks back.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -69,19 +70,25 @@ fn load() -> Fixture {
     }
 }
 
-/// A beldexd stand-in serving one of the fixture's chains.
+/// A beldexd stand-in serving one of the fixture's chains. `cap` limits the
+/// blocks per response (as size limits do) and `behind` hides the chain's
+/// last blocks, like a daemon that has not caught up.
 struct MockDaemon {
-    fixture: Fixture,
-    use_b: Mutex<bool>,
+    fixture: Arc<Fixture>,
+    use_b: Arc<Mutex<bool>>,
+    cap: usize,
+    behind: usize,
+    served: AtomicUsize,
 }
 
 impl MockDaemon {
+    fn new(fixture: Arc<Fixture>, use_b: Arc<Mutex<bool>>, cap: usize, behind: usize) -> Arc<MockDaemon> {
+        Arc::new(MockDaemon { fixture, use_b, cap, behind, served: AtomicUsize::new(0) })
+    }
+
     fn chain(&self) -> &[Block] {
-        if *self.use_b.lock().unwrap() {
-            &self.fixture.b
-        } else {
-            &self.fixture.a
-        }
+        let full = if *self.use_b.lock().unwrap() { &self.fixture.b } else { &self.fixture.a };
+        &full[..full.len() - self.behind.min(full.len() - 1)]
     }
 
     fn get_blocks(&self, body: Bytes) -> Vec<u8> {
@@ -101,9 +108,10 @@ impl MockDaemon {
             root.insert("status", Ev::Bytes(Bytes::from_static(b"Failed")));
             return epee::encode(&root);
         }
+        self.served.fetch_add(1, Ordering::Relaxed);
         let mut blocks = Vec::new();
         let mut indices = Vec::new();
-        for b in &chain[start..] {
+        for b in chain[start..].iter().take(self.cap) {
             let mut entry = Section::default();
             entry.insert("block", Ev::Bytes(Bytes::from(b.blob.clone())));
             if !b.txs.is_empty() {
@@ -182,11 +190,38 @@ async fn scan_until(scanner: &lws_scanner::Scanner, store: &Store, id: i64, heig
     panic!("account never reached height {height}");
 }
 
+fn one_daemon() -> Vec<Arc<MockDaemon>> {
+    vec![MockDaemon::new(Arc::new(load()), Arc::default(), usize::MAX, 0)]
+}
+
+/// Two daemons, one two blocks behind, both answering a few blocks at a time,
+/// so the scanner's fetch window has to spread requests across them, fill
+/// gaps, and get the last blocks from the one that has them.
+fn two_daemons() -> Vec<Arc<MockDaemon>> {
+    let (fixture, use_b) = (Arc::new(load()), Arc::new(Mutex::new(false)));
+    vec![MockDaemon::new(fixture.clone(), use_b.clone(), 3, 2), MockDaemon::new(fixture, use_b, 2, 0)]
+}
+
+fn temp_sqlite(tag: &str) -> (String, std::path::PathBuf) {
+    let path = std::env::temp_dir().join(format!("lws-e2e-{tag}-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    (format!("sqlite:{}", path.display()), path)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sqlite_scans_serves_and_survives_a_reorg() {
-    let path = std::env::temp_dir().join(format!("lws-e2e-{}.db", std::process::id()));
+    let (url, path) = temp_sqlite("one");
+    scenario(&url, one_daemon(), 1).await;
     let _ = std::fs::remove_file(&path);
-    scenario(&format!("sqlite:{}", path.display())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn several_daemons_fetch_in_parallel() {
+    let (url, path) = temp_sqlite("multi");
+    let daemons = two_daemons();
+    scenario(&url, daemons.clone(), 4).await;
+    let served: Vec<usize> = daemons.iter().map(|d| d.served.load(Ordering::Relaxed)).collect();
+    assert!(served.iter().all(|&n| n > 0), "both daemons served blocks: {served:?}");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -199,7 +234,7 @@ async fn postgres_scans_serves_and_survives_a_reorg() {
     admin(&format!("DROP DATABASE IF EXISTS {name}")).await;
     admin(&format!("CREATE DATABASE {name}")).await;
     let (base, _) = url.rsplit_once('/').unwrap();
-    scenario(&format!("{base}/{name}")).await;
+    scenario(&format!("{base}/{name}"), one_daemon(), 1).await;
 }
 
 async fn sqlx_pg_admin(url: &str) -> impl Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
@@ -213,10 +248,13 @@ async fn sqlx_pg_admin(url: &str) -> impl Fn(&str) -> std::pin::Pin<Box<dyn std:
     }
 }
 
-async fn scenario(db_url: &str) {
+async fn scenario(db_url: &str, daemons: Vec<Arc<MockDaemon>>, fetch_window: usize) {
     lws_kernel::self_check().unwrap();
-    let mock = Arc::new(MockDaemon { fixture: load(), use_b: Mutex::new(false) });
-    let url = start_daemon(mock.clone()).await;
+    let mut urls = Vec::new();
+    for d in &daemons {
+        urls.push(start_daemon(d.clone()).await);
+    }
+    let mock = daemons[0].clone();
     let f = &mock.fixture;
 
     let store = Arc::new(Store::connect(db_url, 4, Sealer::new((1, &[8; 32]), &[])).await.unwrap());
@@ -241,9 +279,11 @@ async fn scenario(db_url: &str) {
         _ => unreachable!(),
     };
 
-    let daemon = Arc::new(Daemon::new(&[url], Duration::from_secs(5), Duration::from_secs(5)).unwrap());
+    let daemon = Arc::new(Daemon::new(&urls, Duration::from_secs(5), Duration::from_secs(5)).unwrap());
+    daemon.refresh_heights().await;
     let metrics = Arc::new(Metrics::default());
-    let config = lws_scanner::Config { network: Network::Testnet, lane_window: 100, ..Default::default() };
+    let config =
+        lws_scanner::Config { network: Network::Testnet, lane_window: 100, fetch_window, ..Default::default() };
     let scanner = lws_scanner::Scanner::new(store.clone(), daemon.clone(), metrics.clone(), config, 2).unwrap();
     scanner.ensure_genesis().await.unwrap();
     scan_until(&scanner, &store, account.id, 10).await;

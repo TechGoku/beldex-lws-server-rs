@@ -107,3 +107,53 @@ fn inconsistent_block_responses_are_rejected() {
     root.0.retain(|(k, _)| k != "output_indices");
     assert!(matches!(parse_blocks(Bytes::from(epee::encode(&root))), Err(Error::Decode(_))));
 }
+
+/// A daemon that has `height` blocks: answers explicit requests below it and
+/// refuses the rest, as beldexd does.
+fn daemon_at(height: u64) -> Router {
+    Router::new()
+        .route(
+            "/get_blocks.bin",
+            post(move |body: Bytes| async move {
+                let req = epee::decode(body).unwrap();
+                let start = req.u64("start_height").unwrap();
+                if start >= height {
+                    let mut root = epee::Section::default();
+                    root.insert("status", epee::Value::Bytes(Bytes::from_static(b"Failed")));
+                    return epee::encode(&root);
+                }
+                let mut root = epee::decode(Bytes::from(blocks_response())).unwrap();
+                root.0.retain(|(k, _)| k != "start_height" && k != "current_height");
+                root.insert("start_height", epee::Value::Uint(start));
+                root.insert("current_height", epee::Value::Uint(height));
+                epee::encode(&root)
+            }),
+        )
+        .route(
+            "/json_rpc",
+            post(move || async move { axum::Json(json!({"result": {"height": height, "nettype": "testnet"}})) }),
+        )
+}
+
+#[tokio::test]
+async fn lagging_daemons_are_passed_over() {
+    let behind = serve(daemon_at(40)).await;
+    let ahead = serve(daemon_at(100)).await;
+    let daemon = Daemon::new(&[behind, ahead], Duration::from_secs(2), Duration::from_secs(2)).unwrap();
+
+    // Before heights are known, the lagging daemon is asked first and refuses;
+    // the request falls through to the one that has the block.
+    let request = GetBlocks { start_height: 60, prune: true, ..Default::default() };
+    let blocks = daemon.get_blocks(&request, 0).await.unwrap();
+    assert_eq!((blocks.start_height, blocks.current_height), (60, 100));
+    assert!(daemon.status().iter().all(|e| e.healthy), "being behind is not a failure");
+
+    daemon.refresh_heights().await;
+    assert_eq!(daemon.best_height(), 100);
+    assert_eq!(daemon.order(0), vec![1, 0], "the daemon at the tip goes first");
+    assert_eq!(daemon.status()[0].height, Some(40));
+
+    // Nobody has it: the status is reported, meaning "nothing new yet".
+    let beyond = GetBlocks { start_height: 500, prune: true, ..Default::default() };
+    assert!(matches!(daemon.get_blocks(&beyond, 0).await, Err(Error::Status(_))));
+}

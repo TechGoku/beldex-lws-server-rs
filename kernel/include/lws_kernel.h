@@ -31,7 +31,7 @@
 extern "C" {
 #endif
 
-#define LWS_KERNEL_ABI_VERSION 3u
+#define LWS_KERNEL_ABI_VERSION 4u
 
 /* Status codes. Zero is success; everything else leaves outputs untouched. */
 #define LWS_OK 0
@@ -182,6 +182,13 @@ LWS_API void lws_batch_free(lws_batch* batch);
 LWS_API int lws_scan(const lws_batch* batch, const lws_account* accounts, size_t account_count,
              lws_match** out, size_t* out_count);
 LWS_API void lws_matches_free(lws_match* matches);
+
+/* Like lws_scan, but checks only the given (transaction, account) pairs:
+   pair_tx[i] indexes lws_batch_view.txs and pair_account[i] indexes accounts.
+   For verifying a prefilter's candidates without rescanning whole batches. */
+LWS_API int lws_scan_pairs(const lws_batch* batch, const lws_account* accounts, size_t account_count,
+                           const uint32_t* pair_tx, const uint32_t* pair_account, size_t pair_count,
+                           lws_match** out, size_t* out_count);
 
 LWS_API int lws_address_decode(const char* address, size_t len, uint8_t network,
                        lws_key* view_public, lws_key* spend_public);

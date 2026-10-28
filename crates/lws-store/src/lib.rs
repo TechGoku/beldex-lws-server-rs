@@ -542,13 +542,16 @@ impl Store {
         }
     }
 
-    pub async fn set_status(&self, addresses: &[String], status: AccountStatus) -> Result<u64> {
-        let mut changed = 0;
+    /// Returns the addresses that exist (and so were updated).
+    pub async fn set_status(&self, addresses: &[String], status: AccountStatus) -> Result<Vec<String>> {
+        let mut changed = Vec::new();
         dispatch!(self, pool => {
             let mut tx = pool.begin().await?;
             for address in addresses {
-                changed += sqlx::query("UPDATE accounts SET status = $1 WHERE address = $2")
-                    .bind(status.to_db()).bind(address).execute(&mut *tx).await?.rows_affected();
+                if sqlx::query("UPDATE accounts SET status = $1 WHERE address = $2")
+                    .bind(status.to_db()).bind(address).execute(&mut *tx).await?.rows_affected() == 1 {
+                    changed.push(address.clone());
+                }
             }
             tx.commit().await?;
         });
@@ -564,9 +567,10 @@ impl Store {
 
     /// Operator rescan: moves the accounts' start and scan height to `height`
     /// and deletes what was found above it, in one transaction.
-    pub async fn rescan(&self, addresses: &[String], height: u64) -> Result<u64> {
+    /// Returns the addresses that exist (and so were rescanned).
+    pub async fn rescan(&self, addresses: &[String], height: u64) -> Result<Vec<String>> {
         let h = to_db(height);
-        let mut changed = 0;
+        let mut changed = Vec::new();
         dispatch!(self, pool => {
             let mut tx = pool.begin().await?;
             for address in addresses {
@@ -575,9 +579,10 @@ impl Store {
                 let id = row.i64_("id")?;
                 sqlx::query("DELETE FROM outputs WHERE account_id = $1 AND height > $2").bind(id).bind(h).execute(&mut *tx).await?;
                 sqlx::query("DELETE FROM spends WHERE account_id = $1 AND height > $2").bind(id).bind(h).execute(&mut *tx).await?;
-                changed += sqlx::query(
+                sqlx::query(
                     "UPDATE accounts SET start_height = $1, scan_height = $1, generation = generation + 1 WHERE id = $2")
-                    .bind(h).bind(id).execute(&mut *tx).await?.rows_affected();
+                    .bind(h).bind(id).execute(&mut *tx).await?;
+                changed.push(address.clone());
             }
             tx.commit().await?;
         });
@@ -659,13 +664,16 @@ impl Store {
         })
     }
 
-    pub async fn reject_requests(&self, kind: RequestKind, addresses: &[String]) -> Result<u64> {
-        let mut removed = 0;
+    /// Returns the addresses whose request was pending (and so removed).
+    pub async fn reject_requests(&self, kind: RequestKind, addresses: &[String]) -> Result<Vec<String>> {
+        let mut removed = Vec::new();
         dispatch!(self, pool => {
             let mut tx = pool.begin().await?;
             for address in addresses {
-                removed += sqlx::query("DELETE FROM requests WHERE kind = $1 AND address = $2")
-                    .bind(kind.to_db()).bind(address).execute(&mut *tx).await?.rows_affected();
+                if sqlx::query("DELETE FROM requests WHERE kind = $1 AND address = $2")
+                    .bind(kind.to_db()).bind(address).execute(&mut *tx).await?.rows_affected() == 1 {
+                    removed.push(address.clone());
+                }
             }
             tx.commit().await?;
         });

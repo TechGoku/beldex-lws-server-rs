@@ -55,8 +55,7 @@ fn kernel_scan_throughput() {
     for &n in &[1, threads] {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(n).build().unwrap();
         let began = Instant::now();
-        let flagged =
-            pool.install(|| lws_kernel::fast::candidates(&batch.view(), &keys)).iter().filter(|f| **f).count();
+        let flagged = pool.install(|| lws_kernel::fast::candidates(&batch.view(), &keys)).pairs.len();
         let secs = began.elapsed().as_secs_f64();
         println!(
             "{n:>2} thread(s), fast prefilter: {accounts} accounts x {txs_with_outputs} txs in {secs:.2}s = {:.0} account-tx checks/s ({flagged} flagged)",

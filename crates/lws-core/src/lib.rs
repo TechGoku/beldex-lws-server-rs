@@ -285,6 +285,11 @@ impl Total {
     pub fn get(self) -> u64 {
         u64::try_from(self.0).unwrap_or(u64::MAX)
     }
+    /// The exact total, for arithmetic whose result may fit in 64 bits even
+    /// when its inputs do not.
+    pub fn exact(self) -> u128 {
+        self.0
+    }
 }
 
 #[cfg(test)]

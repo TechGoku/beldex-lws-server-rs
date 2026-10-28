@@ -29,6 +29,8 @@ use crate::{BatchView, Key, ScanKey};
 const TABLE_THRESHOLD: usize = 24;
 /// Transactions whose tables are held at once (about 30 KB each).
 const TX_CHUNK: usize = 256;
+/// Accounts per unit of parallel work.
+const ACCOUNT_BLOCK: usize = 64;
 
 fn varint(mut v: u64, out: &mut [u8; 10]) -> usize {
     let mut n = 0;
@@ -72,6 +74,11 @@ fn decompress(bytes: &Key) -> Option<EdwardsPoint> {
     CompressedEdwardsY(*bytes).decompress()
 }
 
+/// Whether `bytes` encodes a curve point (as `crypto::check_key` checks).
+pub fn is_point(bytes: &Key) -> bool {
+    decompress(bytes).is_some()
+}
+
 fn prepare_account(key: &ScanKey) -> Option<PreparedAccount> {
     let view = Option::<Scalar>::from(Scalar::from_canonical_bytes(key.view_secret))?;
     Some(PreparedAccount { view, spend: decompress(&key.spend_public)? })
@@ -90,27 +97,38 @@ fn owns(tx_key: &TxKey, outputs: &[(u32, EdwardsPoint)], account: &PreparedAccou
     })
 }
 
-/// For each of `keys`, whether it may own an output in the batch. Runs on the
-/// current rayon pool. `true` is conservative: accounts whose keys cannot be
-/// prepared are always flagged so the kernel decides.
-pub fn candidates(view: &BatchView<'_>, keys: &[ScanKey]) -> Vec<bool> {
+/// What the prefilter found in a batch.
+#[derive(Debug, Default)]
+pub struct Candidates {
+    /// `(tx index, key index)`: the account may own an output of that tx.
+    pub pairs: Vec<(u32, u32)>,
+    /// Keys the prefilter could not prepare (not a canonical scalar or point);
+    /// these need a full kernel scan. Never seen for keys that passed login.
+    pub full_scan: Vec<usize>,
+}
+
+/// Screens every (transaction, account) pair in the batch. Runs on the
+/// current rayon pool. A pair is reported if the account may own any output
+/// of the transaction; the kernel then decides.
+pub fn candidates(view: &BatchView<'_>, keys: &[ScanKey]) -> Candidates {
     let accounts: Vec<Option<PreparedAccount>> = keys.par_iter().map(prepare_account).collect();
-    let mut flags: Vec<bool> = accounts.iter().map(Option::is_none).collect();
+    let full_scan: Vec<usize> = accounts.iter().enumerate().filter(|(_, a)| a.is_none()).map(|(i, _)| i).collect();
     let use_tables = keys.len() >= TABLE_THRESHOLD;
 
     let mut txs = Vec::new();
     for block in view.blocks {
-        for tx in block.txs(view) {
+        for (t, tx) in block.txs(view).iter().enumerate() {
             if tx.has_tx_pub_key != 0 && tx.output_count > 0 {
-                txs.push((block.height, tx));
+                txs.push((block.tx_offset + t as u32, block.height, tx));
             }
         }
     }
 
+    let mut pairs = Vec::new();
     for chunk in txs.chunks(TX_CHUNK) {
-        let prepared: Vec<PreparedTx> = chunk
+        let prepared: Vec<(u32, PreparedTx)> = chunk
             .par_iter()
-            .filter_map(|(height, tx)| {
+            .filter_map(|(index, height, tx)| {
                 let point = decompress(&tx.tx_pub_key.data)?;
                 let outputs: Vec<(u32, EdwardsPoint)> =
                     tx.outputs(view).iter().filter_map(|o| Some((o.index, decompress(&o.pub_key.data)?))).collect();
@@ -122,19 +140,28 @@ pub fn candidates(view: &BatchView<'_>, keys: &[ScanKey]) -> Vec<bool> {
                 } else {
                     TxKey::Point(point)
                 };
-                Some(PreparedTx { height: *height, key, outputs })
+                Some((*index, PreparedTx { height: *height, key, outputs }))
             })
             .collect();
 
-        flags.par_iter_mut().zip(accounts.par_iter()).zip(keys.par_iter()).for_each(|((flag, account), key)| {
-            if *flag {
-                return;
-            }
-            let Some(account) = account else { return };
-            *flag = prepared.iter().any(|tx| tx.height > key.scan_height && owns(&tx.key, &tx.outputs, account));
-        });
+        // Work items are (transaction, block of accounts), so every core is
+        // busy whether the batch holds many transactions or many accounts.
+        let blocks_of_accounts = keys.len().div_ceil(ACCOUNT_BLOCK).max(1);
+        let accounts = &accounts;
+        let prepared = &prepared;
+        pairs.par_extend((0..prepared.len() * blocks_of_accounts).into_par_iter().flat_map_iter(move |item| {
+            let (tx_index, tx) = &prepared[item / blocks_of_accounts];
+            let first = (item % blocks_of_accounts) * ACCOUNT_BLOCK;
+            (first..(first + ACCOUNT_BLOCK).min(keys.len()))
+                .filter(move |&i| {
+                    tx.height > keys[i].scan_height
+                        && accounts[i].as_ref().is_some_and(|a| owns(&tx.key, &tx.outputs, a))
+                })
+                .map(move |i| (*tx_index, i as u32))
+        }));
     }
-    flags
+    pairs.sort_unstable();
+    Candidates { pairs, full_scan }
 }
 
 #[cfg(test)]
@@ -188,6 +215,9 @@ mod tests {
 
     #[test]
     fn unpreparable_keys_are_left_to_the_kernel() {
+        let view = BatchView { blocks: &[], txs: &[], inputs: &[], outputs: &[], ring_members: &[] };
+        let bad = ScanKey { view_secret: [0xff; 32], spend_public: [0; 32], scan_height: 0 };
+        assert_eq!(candidates(&view, &[bad]).full_scan, vec![0]);
         let bad = ScanKey { view_secret: [0xff; 32], spend_public: [0; 32], scan_height: 0 };
         assert!(prepare_account(&bad).is_none());
     }
