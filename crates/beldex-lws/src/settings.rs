@@ -187,6 +187,12 @@ pub struct ServeArgs {
     /// the fast prefilter first (slower; for diagnosis).
     #[arg(long, env = "LWS_NO_FAST_SCAN", value_parser = BoolishValueParser::new())]
     pub no_fast_scan: bool,
+    /// beldexd OxenMQ endpoints to subscribe to for new-block announcements,
+    /// e.g. ipc:///var/lib/beldex/beldexd.sock or tcp://10.0.0.1:20202
+    /// (beldexd --lmq-public). The scanner then reacts to a new block at once
+    /// instead of at the next poll. Repeatable; same as the LMDB server's --sub.
+    #[arg(long = "notify", alias = "sub", env = "LWS_NOTIFY", value_delimiter = ',')]
+    pub notify: Vec<String>,
     /// Download full transactions instead of pruned ones.
     #[arg(long, env = "LWS_NO_PRUNE", value_parser = BoolishValueParser::new())]
     pub no_prune: bool,
@@ -238,8 +244,6 @@ pub struct LegacyServeArgs {
     pub db_max_readers: Option<String>,
     #[arg(long, hide = true)]
     pub create_queue_max: Option<String>,
-    #[arg(long, hide = true)]
-    pub sub: Option<String>,
     #[arg(long, hide = true)]
     pub exchange_rate_interval: Option<String>,
     #[arg(long, hide = true)]
@@ -309,7 +313,6 @@ impl ServeArgs {
             ("--db-map-size", legacy.db_map_size.is_some()),
             ("--db-max-readers", legacy.db_max_readers.is_some()),
             ("--create-queue-max", legacy.create_queue_max.is_some()),
-            ("--sub", legacy.sub.is_some()),
             ("--exchange-rate-interval", legacy.exchange_rate_interval.is_some()),
             ("--rest-threads", legacy.rest_threads.is_some()),
             ("--daemon-spread", legacy.daemon_spread),

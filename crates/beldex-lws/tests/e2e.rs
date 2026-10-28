@@ -333,3 +333,41 @@ async fn scenario(db_url: &str, daemons: Vec<Arc<MockDaemon>>, fetch_window: usi
     let txs = call(&api, "/get_address_txs", creds).await;
     assert_eq!(txs["transactions"].as_array().unwrap().len(), 2);
 }
+
+/// A block announcement wakes an idle scanner once, promptly, and it does not
+/// spin afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn block_announcements_wake_the_scanner_once() {
+    let (db, path) = temp_sqlite("notify");
+    let mock = one_daemon().remove(0);
+    let url = start_daemon(mock.clone()).await;
+    let store = Arc::new(Store::connect(&db, 4, Sealer::new((1, &[8; 32]), &[])).await.unwrap());
+    store.migrate().await.unwrap();
+    store.check_network(Network::Testnet).await.unwrap();
+    let daemon = Arc::new(Daemon::new(&[url], Duration::from_secs(5), Duration::from_secs(5)).unwrap());
+    let metrics = Arc::new(Metrics::default());
+    let config =
+        lws_scanner::Config { network: Network::Testnet, poll_interval: Duration::from_secs(30), ..Default::default() };
+    let (announce, blocks) = tokio::sync::watch::channel(0u64);
+    let scanner =
+        lws_scanner::Scanner::new(store, daemon, metrics.clone(), config, 1).unwrap().with_block_notifications(blocks);
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move { scanner.run(shutdown).await });
+
+    let passes = || Metrics::get(&metrics.scan_passes_total);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let idle = passes();
+    assert!(idle >= 1, "first pass ran");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(passes(), idle, "no polling within the 30 s interval");
+
+    announce.send_replace(11);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(passes(), idle + 1, "one announcement, one pass");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(passes(), idle + 1, "no spinning after the announcement");
+
+    stop.send_replace(true);
+    task.await.unwrap().unwrap();
+    let _ = std::fs::remove_file(&path);
+}

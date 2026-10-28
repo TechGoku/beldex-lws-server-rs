@@ -12,6 +12,7 @@
 //! instead of reading as "nothing new".
 
 pub mod epee;
+pub mod notify;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;

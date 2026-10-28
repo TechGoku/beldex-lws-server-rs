@@ -12,7 +12,7 @@ RUN make dist
 
 FROM ubuntu:24.04
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      ca-certificates libsodium23 libboost-serialization1.83.0 libboost-program-options1.83.0 \
+      ca-certificates libsodium23 libzmq5 libboost-serialization1.83.0 libboost-program-options1.83.0 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --home /var/lib/beldex-lws --create-home beldex-lws
 COPY --from=build /src/dist/beldex-lws-*/bin /opt/beldex-lws/bin

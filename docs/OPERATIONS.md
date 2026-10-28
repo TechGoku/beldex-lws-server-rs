@@ -49,6 +49,20 @@ List every daemon in `--daemon` (comma-separated, primary first):
   than 5 blocks behind the best is tried after the others. A request for
   blocks it does not have yet falls through to one that has them, instead of
   being read as "nothing new".
+- **Instant new blocks.** With `--notify` (alias `--sub`, as on the LMDB
+  server), the scanner subscribes to beldexd's OxenMQ block announcements and
+  starts on a new block at once instead of at the next poll:
+
+  ```bash
+  --notify ipc:///var/lib/beldex/beldexd.sock      # beldexd's default local socket
+  --notify tcp://10.0.0.2:20202                    # beldexd --lmq-public tcp://...
+  ```
+
+  Measured on testnet: 0-25 ms from block to scan, against the 5 s default
+  poll. The subscription is renewed every 10 s; a daemon restart is noticed on
+  the next renewal and the scanner catches up straight away. Polling stays on
+  as the fallback. `beldex_lws_block_notifications_connected` and
+  `_total` are in the metrics.
 - `/health` on the admin listener shows each daemon's state, height and last
   error.
 
@@ -173,7 +187,8 @@ admin-account authorisation and response shapes are the same.
 | `--rest-max-response-bytes`, `--rest-cache-bytes` | `--max-response-mb`, `--response-cache-mb` |
 | `--log-level 0-4` | same, or names (`info`, `debug`, ...) |
 | `--db-path` | SQLite and sealing key in that directory, plus the one-time import |
-| `--db-map-size`, `--db-max-readers`, `--create-queue-max`, `--daemon-spread`, `--sub`, `--rest-threads`, `--exchange-rate-interval` | accepted, no effect (noted at startup) |
+| `--sub ipc://.../beldexd.sock` | `--notify` (instant new-block wake-ups) |
+| `--db-map-size`, `--db-max-readers`, `--create-queue-max`, `--daemon-spread`, `--rest-threads`, `--exchange-rate-interval` | accepted, no effect (noted at startup) |
 
 Differences to know about:
 

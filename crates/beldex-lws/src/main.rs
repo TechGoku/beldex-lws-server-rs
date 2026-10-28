@@ -213,6 +213,34 @@ async fn serve(mut args: ServeArgs) -> Result<()> {
 
     let mut tasks = tokio::task::JoinSet::new();
 
+    // New-block announcements from beldexd, when --notify/--sub is given.
+    let notify_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let blocks = if args.notify.is_empty() {
+        None
+    } else {
+        let (rx, state) = lws_daemon::notify::subscribe(&args.notify, notify_stop.clone());
+        let (m, mut changes, mut stop) = (metrics.clone(), rx.clone(), stop_rx.clone());
+        tasks.spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = changes.changed() => {}
+                    _ = stop.changed() => break,
+                }
+                Metrics::set(&m.block_notifications_total, state.notifications.load(Relaxed));
+                Metrics::set(&m.block_notifications_connected, u64::from(state.connected.load(Relaxed)));
+                let height = state.height.load(Relaxed);
+                if height > 0 {
+                    m.daemon_height.fetch_max(height + 1, Relaxed);
+                }
+            }
+            Ok(())
+        });
+        Some(rx)
+    };
+
     if matches!(args.role, Role::All | Role::Scanner) {
         let threads = args.scan_threads.unwrap_or(cores);
         let config = lws_scanner::Config {
@@ -233,7 +261,10 @@ async fn serve(mut args: ServeArgs) -> Result<()> {
             instance: args.instance_name(),
         };
         info!(threads, shard = ?config.shard, "starting scanner");
-        let scanner = lws_scanner::Scanner::new(primary.clone(), daemon.clone(), metrics.clone(), config, threads)?;
+        let mut scanner = lws_scanner::Scanner::new(primary.clone(), daemon.clone(), metrics.clone(), config, threads)?;
+        if let Some(blocks) = &blocks {
+            scanner = scanner.with_block_notifications(blocks.clone());
+        }
         let rx = stop_rx.clone();
         tasks.spawn(async move { scanner.run(rx).await.context("scanner") });
     }
@@ -296,6 +327,7 @@ async fn serve(mut args: ServeArgs) -> Result<()> {
         }
     }
     tasks.abort_all();
+    notify_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     primary.close().await;
     result
 }

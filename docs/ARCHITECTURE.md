@@ -90,6 +90,9 @@ scans only `id % count == index`.
   The batch size is learned from the daemons; gaps are filled and overlaps
   dropped, and batches are applied in height order with hash-chain checks
   between them. Daemons that are behind the tip are tried last.
+- **New blocks.** With `--notify`, an OxenMQ subscription to beldexd wakes the
+  scanner the moment a block is added (one wake per announcement); polling is
+  the fallback.
 - **Reorgs.** Each block request carries a sparse list of our block hashes:
   ten dense, then exponentially further back, ending with genesis. Stock
   `beldexd` answers from the highest one still on its chain, so a fork is

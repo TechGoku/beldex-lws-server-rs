@@ -86,6 +86,9 @@ pub struct Scanner {
     metrics: Arc<Metrics>,
     config: Config,
     pool: Arc<rayon::ThreadPool>,
+    /// New-block announcements; wakes the scanner instead of waiting for
+    /// the next poll.
+    blocks: Option<watch::Receiver<u64>>,
 }
 
 /// A batch after kernel parsing and scanning, as plain owned data.
@@ -245,7 +248,14 @@ impl Scanner {
             .thread_name(|i| format!("lws-scan-{i}"))
             .build()
             .context("building scan thread pool")?;
-        Ok(Scanner { store, daemon, metrics, config, pool: Arc::new(pool) })
+        Ok(Scanner { store, daemon, metrics, config, pool: Arc::new(pool), blocks: None })
+    }
+
+    /// Wake on new-block announcements (see `lws_daemon::notify`) as well as
+    /// on the poll interval.
+    pub fn with_block_notifications(mut self, blocks: watch::Receiver<u64>) -> Scanner {
+        self.blocks = Some(blocks);
+        self
     }
 
     /// Makes sure the genesis hash is stored: every `get_blocks.bin` block-id
@@ -288,6 +298,10 @@ impl Scanner {
         self.ensure_genesis().await?;
         let lease = lease_name(self.config.shard);
         let mut holding = false;
+        let mut blocks = self.blocks.clone();
+        if let Some(rx) = blocks.as_mut() {
+            rx.borrow_and_update();
+        }
         let mut failures = 0u32;
         info!(%lease, instance = %self.config.instance, "scanner started");
 
@@ -322,9 +336,20 @@ impl Scanner {
                 }
             };
             if !wait.is_zero() {
+                // One receiver for the whole run: it remembers which
+                // announcement it has seen, so each block wakes us once.
+                let announced = async {
+                    match blocks.as_mut() {
+                        Some(rx) => {
+                            let _ = rx.changed().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                };
                 tokio::select! {
                     _ = tokio::time::sleep(wait) => {}
                     _ = shutdown.changed() => {}
+                    _ = announced => debug!("woken by a new block"),
                 }
             }
         }
@@ -337,6 +362,7 @@ impl Scanner {
 
     /// One pass over every lane. Returns whether anything was committed.
     pub async fn pass(&self) -> anyhow::Result<bool> {
+        Metrics::add(&self.metrics.scan_passes_total, 1);
         let accounts = self.store.scan_targets(self.config.shard).await?;
         Metrics::set(&self.metrics.scanned_accounts, accounts.len() as u64);
         if accounts.is_empty() {

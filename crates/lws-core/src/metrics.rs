@@ -35,6 +35,8 @@ metrics! {
     counter spends_found_total,
     /// Chain reorganisations handled.
     counter reorgs_total,
+    /// Scan passes run (each checks every lane once).
+    counter scan_passes_total,
     /// Scanner batches that failed and were retried.
     counter scan_errors_total,
     /// Account commits refused because the account changed underneath.
@@ -63,6 +65,10 @@ metrics! {
     gauge http_in_flight,
     /// Accounts created through /login.
     counter accounts_created_total,
+    /// New-block announcements received over OxenMQ (--sub).
+    counter block_notifications_total,
+    /// 1 while at least one OxenMQ block subscription is live.
+    gauge block_notifications_connected,
 }
 
 impl Metrics {
