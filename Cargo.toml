@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/lws-kernel",
+  "crates/lws-core",
+  "crates/lws-store",
+  "crates/lws-daemon",
+  "crates/lws-scanner",
+  "crates/lws-api",
+  "crates/beldex-lws",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+rust-version = "1.80"
+
+[workspace.dependencies]
+lws-kernel = { path = "crates/lws-kernel" }
+lws-core = { path = "crates/lws-core" }
+lws-store = { path = "crates/lws-store" }
+lws-daemon = { path = "crates/lws-daemon" }
+lws-scanner = { path = "crates/lws-scanner" }
+lws-api = { path = "crates/lws-api" }
+
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+bytes = "1"
+chacha20poly1305 = "0.10"
+curve25519-dalek = { version = "4", features = ["precomputed-tables"] }
+sha3 = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+cmake = "0.1"
+futures = "0.3"
+hex = "0.4"
+moka = { version = "0.12", features = ["future"] }
+rand = "0.9"
+rand_distr = "0.5"
+rayon = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "macros", "migrate", "postgres", "sqlite"] }
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"] }
+toml = "0.8"
+tower = { version = "0.5", features = ["limit", "load-shed", "timeout", "util"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "cors", "limit", "set-header", "timeout", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

@@ -1,0 +1,3 @@
+[submodule "external/beldex"]
+	path = external/beldex
+	url = https://github.com/TechGoku/beldex.git

@@ -1,0 +1,17 @@
+[package]
+name = "lws-scanner"
+description = "Chain scanner for the Beldex light wallet server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lws-core.workspace = true
+lws-daemon.workspace = true
+lws-kernel.workspace = true
+lws-store.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+rayon.workspace = true
+tokio.workspace = true
+tracing.workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "lws-core"
+description = "Domain types shared by every part of the Beldex light wallet server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lws-kernel.workspace = true
+hex.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+time.workspace = true
+zeroize.workspace = true

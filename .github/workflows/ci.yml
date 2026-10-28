@@ -1,0 +1,34 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: lws
+          POSTGRES_PASSWORD: lws
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U lws" --health-interval 5s
+    env:
+      LWS_TEST_POSTGRES_URL: postgres://lws:lws@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libboost-all-dev libsodium-dev libssl-dev libsqlite3-dev libzmq3-dev libcurl4-openssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+      - uses: actions/cache@v4
+        with:
+          path: |
+            build/kernel
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-${{ hashFiles('Cargo.lock', 'kernel/**', '.gitmodules') }}
+      - run: make lint
+      - run: make test

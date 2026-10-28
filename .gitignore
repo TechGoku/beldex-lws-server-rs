@@ -1,0 +1,9 @@
+/target
+/build
+/dist
+*.db
+*.db-shm
+*.db-wal
+*.key
+*.token
+accounts*.json

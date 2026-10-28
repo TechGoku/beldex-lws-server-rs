@@ -1,0 +1,30 @@
+# beldex-lws configuration. Keys are the long option names of `beldex-lws serve`
+# (see `beldex-lws serve --help`); environment variables (LWS_*) and command-line
+# flags override anything here. Keep the database password in LWS_DATABASE_URL
+# rather than in this file if other users can read it.
+
+network = "main"
+role = "all"                                   # all | api | scanner
+
+database = "postgres://lws@127.0.0.1/beldex_lws"
+# database-read = "postgres://lws@replica/beldex_lws"
+sealing-key-file = "/etc/beldex-lws/seal.key"
+admin-token-file = "/etc/beldex-lws/admin.token"
+
+daemon = ["http://127.0.0.1:19091", "http://10.0.0.2:19091"]
+
+listen = "0.0.0.0:8443"
+tls-cert = "/etc/beldex-lws/tls/fullchain.pem"
+tls-key = "/etc/beldex-lws/tls/privkey.pem"
+admin-listen = "127.0.0.1:8444"
+
+account-creation = "auto"                      # auto | manual | disabled
+rate-limit = 20                                # requests/second per client
+rate-burst = 60
+creations-per-hour = 30
+max-in-flight = 4096
+# cors-origin = ["https://wallet.example"]
+
+# scan-shard = "0/2"                           # this process scans ids % 2 == 0
+scan-lanes = 4
+log-format = "json"

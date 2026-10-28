@@ -1,0 +1,177 @@
+# Architecture
+
+## Components
+
+```
+                        wallets (web, mobile, desktop)
+                                     |
+                              TLS load balancer
+                 +-------------------+-------------------+
+                 |                   |                   |
+           beldex-lws           beldex-lws          beldex-lws        role=api, stateless,
+           --role api           --role api          --role api        any number
+                 |                   |                   |
+                 +---------+---------+---------+---------+
+                           |  reads (replica)  |  writes
+                           v                   v
+                 PostgreSQL replica  <---  PostgreSQL primary
+                                               ^
+                           +-------------------+-------------------+
+                           |                                       |
+                     beldex-lws                              beldex-lws         role=scanner,
+                     --role scanner --scan-shard 0/2         --scan-shard 1/2   one lease per shard,
+                           |                                       |            standbys allowed
+                           +------------------+--------------------+
+                                              v
+                                   beldexd (one or more, failover)
+```
+
+A single process (`--role all`, SQLite or PostgreSQL) runs everything for
+small installs.
+
+### C++ scan kernel (`kernel/`)
+
+The kernel is the only code that understands Beldex consensus formats. It
+exposes a small C ABI (`kernel/include/lws_kernel.h`) for:
+
+- parsing a run of `get_blocks.bin` entries into flat arrays of blocks, txs,
+  inputs (with absolute ring members) and outputs (with global indices);
+- scanning those for a set of view keys: ownership, ringct amount decoding,
+  HF22 privacy-token (zyphora) decoding with commitment verification, and
+  payment-id decryption;
+- addresses, view-key checks, and the API's `rct` blob.
+
+It links beldex core statically from a pinned submodule, so it parses exactly
+what the node accepts. A transaction version it does not know is a hard
+error: the scanner stops and alerts rather than skipping data.
+
+The ABI is versioned. Rust checks the version and every struct size at
+startup, so a mismatched library fails before doing any work.
+
+### Fast prefilter (`crates/lws-kernel/src/fast.rs`)
+
+The scanner's cost is (accounts × transactions) elliptic-curve checks. The
+prefilter computes the same ownership test as beldex core with
+curve25519-dalek. It builds one precomputed table per transaction public key
+and shares it across all accounts, which turns the per-account variable-base
+multiplication into a fixed-base one.
+
+The prefilter only screens. Accounts it flags are rescanned by the kernel,
+which alone decides ownership and decodes amounts. Its tests check it against
+the kernel's own key derivation on random keys.
+
+Measured on the development machine (12 threads), per account-transaction check:
+
+| Path | 1 thread | 12 threads |
+| --- | --- | --- |
+| Kernel only (beldex core ref10) | 8,500/s | 41,000/s |
+| Fast prefilter, then kernel on hits | 40,000/s | 192,000/s |
+
+`make bench` measures your hardware. To size a deployment, divide (active
+accounts × transactions per block) by the measured rate, and compare that with
+the 30-second block time. A single 12-thread machine keeps a few hundred
+thousand accounts at the tip. Beyond that, add scanner shards: each shard
+scans only `id % count == index`.
+
+### Scanner (`crates/lws-scanner`)
+
+- **Lanes.** Accounts are grouped by scan height. Each pass runs the tip lane,
+  which holds nearly every account, plus the furthest-behind lanes in
+  parallel, so a wallet importing from genesis never slows balance updates for
+  everyone else. Lanes are regrouped every pass and merge as they catch up.
+- **Pipelining.** The next block request is in flight while the current batch
+  is parsed and scanned on the CPU pool.
+- **Reorgs.** Each block request carries a sparse list of our block hashes:
+  ten dense, then exponentially further back, ending with genesis. Stock
+  `beldexd` answers from the highest one still on its chain, so a fork is
+  detected without extra requests. Rolling back is one transaction.
+- **Spends.** Ring members are looked up in the database by global index, plus
+  outputs found earlier in the same batch. The scanner holds no per-account
+  state in memory, so its memory does not grow with the number of accounts.
+- **Coordination.** Each shard is owned through a lease row with a TTL. A second
+  process for the same shard waits as a hot standby and takes over when the
+  holder stops renewing.
+
+### Storage (`crates/lws-store`)
+
+One `Store` type over PostgreSQL or SQLite. Every query is written once and
+compiled against both backends, so they cannot drift apart.
+
+The scanner and API rely on these invariants:
+
+1. A scanner commit writes outputs, spends, block hashes and the new scan
+   height in **one transaction**. A reader never sees a scan height whose rows
+   are missing.
+2. A commit is checked against the **chain epoch**. Every rollback bumps the
+   epoch, so a batch fetched before a reorg cannot be written after it.
+3. Each account has a **generation**, bumped by every rescan and rollback.
+   Progress made against an older generation is discarded, never merged.
+4. Stored block hashes are compared with the batch's. A disagreement means the
+   stored branch is stale, and it is rolled back.
+5. Scan heights only move backwards through a rollback or an operator rescan,
+   both of which delete the rows above the new height in the same transaction.
+6. Chain `u64` values are stored bit-cast into `BIGINT` and never summed in
+   SQL. Totals are computed in Rust with overflow checks.
+
+Migrations are embedded in the binary. Each one runs once inside a
+transaction, is recorded with a checksum, and is serialised across processes.
+
+### API (`crates/lws-api`)
+
+The REST layer is stateless apart from caches. Each replica protects itself:
+
+- body limits per endpoint;
+- a request timeout;
+- a concurrency cap that sheds excess requests with an immediate 503 instead
+  of queueing them;
+- a sharded token-bucket limiter per client (IPv6 bucketed by /64);
+- a stricter hourly limit on account creation.
+
+Expensive endpoints share a single-flight response cache keyed by account,
+generation, scan height and chain tip. A wallet polling every few seconds then
+costs one computation per block, not one per poll. Daemon data (stakes, fees,
+fork version, output distribution, token descriptors) is cached with a TTL,
+refreshed by a single caller, and served stale for up to two minutes if
+`beldexd` is briefly unavailable.
+
+## Security model
+
+- **View keys** are sealed with XChaCha20-Poly1305 under a key kept outside the
+  database. The account address is the associated data, so a sealed key moved
+  to another row fails to open. Keys rotate with `admin reseal`. In memory, view
+  keys are zeroed on drop and never printed.
+- **Authentication.** A view key must derive the address's public view key
+  (checked by the kernel), and must equal the stored key (compared in constant
+  time). Hidden and unknown accounts get the same 403.
+- **The admin API** runs on a separate listener (refused on `0.0.0.0`) and
+  needs `Authorization: Bearer`, compared in constant time.
+- **Transport.** TLS is built in (rustls). Plain HTTP on a non-loopback address
+  is refused unless the operator confirms a TLS proxy sits in front.
+- **Secret files** (sealing key, admin token) must be mode 0600. Exports are
+  written 0600 and never overwrite an existing file.
+- **Network binding.** The database is bound to a network on first use, and the
+  scanner refuses a daemon on another network. A foreign chain would otherwise
+  look like a deep reorg.
+- **Untrusted daemon input.**
+  - The epee decoder bounds every length by the bytes remaining and caps
+    nesting depth.
+  - The kernel refuses inconsistent output-index lists rather than
+    misattributing outputs.
+  - Token outputs are only stored after their commitment verifies.
+
+## Compared with the LMDB server (`lws-implementation`)
+
+| | LMDB server | beldex-lws |
+| --- | --- | --- |
+| Code | ~22k lines of C++ inside the node tree | Standalone; Rust service, small C++ kernel |
+| Storage | LMDB: one writer, map size, reader slots | PostgreSQL or SQLite, row-level concurrency |
+| Fixes it needed | `MDB_MAP_FULL`, orphaned reader slots, migrations re-running | Not applicable, or handled by the database |
+| Block source | Custom JSON `get_blocks_fast` (node-side re-encoding) | Stock `get_blocks.bin`, parsed by beldex core |
+| Reorg detection | Separate hash comparison | Built into the block request (split point) |
+| Rescan / rollback | Outage, or shadow DB + rebuild tool + `/switch_db` | One transaction per account; the API keeps serving |
+| Backups | Custom `beldex-lws-backup` | PostgreSQL tooling (PITR, replicas); SQLite online backup |
+| Scaling | One process | API replicas plus scanner shards with leases |
+| Scan cost | ref10 per account | Shared per-tx tables (about 4.7x), all cores |
+| View keys at rest | Plaintext | Encrypted (XChaCha20-Poly1305) |
+| `locked_funds` | Master-node RPC on every request | Cached, single-flight, stale-tolerant |
+| API wire format | Reference | Same |

@@ -1,0 +1,38 @@
+[package]
+name = "beldex-lws"
+description = "Beldex light wallet server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "beldex-lws"
+path = "src/main.rs"
+
+[dependencies]
+lws-api.workspace = true
+lws-core.workspace = true
+lws-daemon.workspace = true
+lws-kernel.workspace = true
+lws-scanner.workspace = true
+lws-store.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+clap.workspace = true
+hex.workspace = true
+rand.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+rayon.workspace = true
+tower.workspace = true

@@ -1,0 +1,51 @@
+# A complete testnet stack: PostgreSQL, one API replica and one scanner.
+# Create the secrets first:
+#   mkdir -p secrets && beldex-lws keygen secrets/seal.key && beldex-lws keygen secrets/admin.token
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: lws
+      POSTGRES_PASSWORD: change-me
+      POSTGRES_DB: beldex_lws
+    volumes: [db:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lws"]
+      interval: 5s
+
+  migrate:
+    image: beldex-lws
+    command: ["migrate"]
+    environment: &env
+      LWS_DATABASE_URL: postgres://lws:change-me@db/beldex_lws
+      LWS_SEALING_KEY_FILE: /run/secrets/seal.key
+      LWS_NETWORK: test
+      LWS_DAEMON: http://host.docker.internal:29091
+    secrets: [seal.key]
+    depends_on: { db: { condition: service_healthy } }
+
+  scanner:
+    image: beldex-lws
+    command: ["serve", "--role", "scanner", "--no-migrate"]
+    environment: *env
+    secrets: [seal.key]
+    depends_on: { migrate: { condition: service_completed_successfully } }
+    extra_hosts: ["host.docker.internal:host-gateway"]
+
+  api:
+    image: beldex-lws
+    command: ["serve", "--role", "api", "--no-migrate", "--listen", "0.0.0.0:8443",
+              "--confirm-external-bind", "--admin-listen", "127.0.0.1:8444",
+              "--admin-token-file", "/run/secrets/admin.token"]
+    environment: *env
+    secrets: [seal.key, admin.token]
+    ports: ["127.0.0.1:8443:8443"]
+    depends_on: { migrate: { condition: service_completed_successfully } }
+    extra_hosts: ["host.docker.internal:host-gateway"]
+
+secrets:
+  seal.key: { file: ./secrets/seal.key }
+  admin.token: { file: ./secrets/admin.token }
+
+volumes:
+  db:
