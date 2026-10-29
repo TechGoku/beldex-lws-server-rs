@@ -6,7 +6,7 @@ BUILD_TYPE   ?= Release
 VERSION      := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 export LWS_KERNEL_LIB_DIR := $(CURDIR)/$(KERNEL_BUILD)
 
-.PHONY: all kernel build release test bench fixture dist fmt lint clean
+.PHONY: all kernel build release test bench fixture dist install fmt lint clean
 
 all: release
 
@@ -47,8 +47,14 @@ dist: release
 	mkdir -p dist/beldex-lws-$(VERSION)/bin dist/beldex-lws-$(VERSION)/lib
 	cp target/release/beldex-lws dist/beldex-lws-$(VERSION)/bin/
 	cp $(KERNEL_BUILD)/libbeldex_lws_kernel.so dist/beldex-lws-$(VERSION)/lib/
-	cp -r README.md docs deploy dist/beldex-lws-$(VERSION)/
+	cp -r README.md LICENSE docs deploy dist/beldex-lws-$(VERSION)/
+	cp deploy/install.sh dist/beldex-lws-$(VERSION)/install.sh
 	tar -C dist -czf dist/beldex-lws-$(VERSION)-linux-$(shell uname -m).tar.gz beldex-lws-$(VERSION)
+
+# As root: installs the systemd service, configures it and starts it.
+# Pass setup options through ARGS, e.g. make install ARGS="--yes --network test".
+install:
+	deploy/install.sh $(ARGS)
 
 clean:
 	cargo clean

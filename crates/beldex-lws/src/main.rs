@@ -8,6 +8,7 @@
 mod admin_cli;
 mod legacy;
 mod settings;
+mod setup;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -40,6 +41,14 @@ struct Cli {
 enum Command {
     /// Run the server (API, scanner, or both).
     Serve(Box<ServeArgs>),
+    /// Write a working configuration: finds beldexd, creates the keys and
+    /// the config file. Asks before each choice on a terminal.
+    #[command(alias = "init")]
+    Setup(Box<setup::SetupArgs>),
+    /// Check an installation (config, keys, database, beldexd, TLS, ports)
+    /// with the same options as `serve`, and say what is wrong.
+    #[command(alias = "check")]
+    Doctor(Box<ServeArgs>),
     /// Apply database migrations and exit.
     Migrate(StoreArgs),
     /// Administer accounts directly in the database. Safe while the server runs.
@@ -49,6 +58,9 @@ enum Command {
     Keygen {
         /// File to create; refuses to overwrite. Written with mode 0600.
         out: PathBuf,
+        /// Succeed without writing when the file already exists.
+        #[arg(long)]
+        keep: bool,
     },
 }
 
@@ -189,6 +201,7 @@ async fn serve(mut args: ServeArgs) -> Result<()> {
         primary.migrate().await.context("applying migrations")?;
     }
     primary.check_network(args.network).await?;
+    primary.check_sealing_key().await?;
     // Running in the LMDB server's directory: bring its accounts over once.
     if let Some(dir) = &args.store.db_path {
         if dir.join("data.mdb").exists() && primary.counts().await?.0 == 0 {
@@ -215,10 +228,15 @@ async fn serve(mut args: ServeArgs) -> Result<()> {
 
     // New-block announcements from beldexd, when --notify/--sub is given.
     let notify_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let blocks = if args.notify.is_empty() {
+    let (notify, found) = args.notify_endpoints();
+    if found {
+        info!(endpoint = %notify[0], "subscribing to the local beldexd's block announcements");
+    }
+    let blocks = if notify.is_empty() {
+        info!(every_s = args.poll_interval, "no beldexd socket for block announcements (--notify); polling");
         None
     } else {
-        let (rx, state) = lws_daemon::notify::subscribe(&args.notify, notify_stop.clone());
+        let (rx, state) = lws_daemon::notify::subscribe(&notify, notify_stop.clone());
         let (m, mut changes, mut stop) = (metrics.clone(), rx.clone(), stop_rx.clone());
         tasks.spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
@@ -288,13 +306,7 @@ async fn serve(mut args: ServeArgs) -> Result<()> {
         let tls = args.tls_cert.clone().zip(args.tls_key.clone());
         tasks.spawn(serve_http("wallet API", lws_api::public_router(state.clone()), args.listen, tls, stop_rx.clone()));
 
-        let token = match &args.admin_token_file {
-            Some(path) => Some(read_secret_file(path)?.as_bytes().to_vec()),
-            None => {
-                info!("no --admin-token-file: admin routes accept only the LMDB server's admin-account auth");
-                None
-            }
-        };
+        let token = Some(read_secret_file(&args.admin_token_path()?)?.as_bytes().to_vec());
         match args.admin_addr() {
             Some(addr) => {
                 let admin =
@@ -360,11 +372,12 @@ fn main() -> Result<()> {
     settings::apply_config_file()?;
     let mut cli = Cli::parse_from(arguments());
     let mut notes = Vec::new();
-    if let Command::Serve(a) = &mut cli.command {
+    if let Command::Serve(a) | Command::Doctor(a) = &mut cli.command {
         notes = a.apply_legacy()?;
     }
     let (log_format, log_level) = match &cli.command {
         Command::Serve(a) => (a.log_format.clone(), a.log_level.clone()),
+        Command::Doctor(_) | Command::Setup(_) => ("text".to_owned(), "error".to_owned()),
         _ => ("text".to_owned(), "info".to_owned()),
     };
     init_logging(&log_format, &log_level);
@@ -387,6 +400,8 @@ fn main() -> Result<()> {
     runtime.block_on(async move {
         match cli.command {
             Command::Serve(args) => serve(*args).await,
+            Command::Setup(args) => setup::setup(*args).await,
+            Command::Doctor(args) => setup::doctor(*args).await,
             Command::Migrate(mut args) => {
                 args.resolve()?;
                 let store = open_store(&args, args.url(), 2).await?;
@@ -395,10 +410,12 @@ fn main() -> Result<()> {
                 Ok(())
             }
             Command::Admin(cmd) => admin_cli::run(cmd).await,
-            Command::Keygen { out } => {
-                let mut secret = zeroize::Zeroizing::new([0u8; 32]);
-                rand::RngCore::fill_bytes(&mut rand::rng(), secret.as_mut());
-                write_secret_file(&out, format!("{}\n", hex::encode(secret.as_ref())).as_bytes())?;
+            Command::Keygen { out, keep } => {
+                if keep && out.exists() {
+                    println!("kept {}", out.display());
+                    return Ok(());
+                }
+                settings::write_new_key(&out)?;
                 println!("wrote {}", out.display());
                 Ok(())
             }

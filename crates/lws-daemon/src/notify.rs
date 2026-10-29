@@ -70,6 +70,49 @@ fn run(context: &zmq::Context, endpoint: &str, tx: &watch::Sender<u64>, state: &
     }
 }
 
+/// Connects once, handshakes and subscribes, then hangs up: for checking an
+/// endpoint (`beldex-lws doctor`) without starting a subscriber.
+pub fn probe(endpoint: &str, timeout: Duration) -> Result<(), String> {
+    if let Some(path) = endpoint.strip_prefix("ipc://") {
+        if !std::path::Path::new(path).exists() {
+            return Err(format!("{path} does not exist (is beldexd running with that data directory?)"));
+        }
+        #[cfg(unix)]
+        if let Err(e) = std::os::unix::net::UnixStream::connect(path) {
+            return Err(format!("cannot connect to {path}: {e}"));
+        }
+    }
+    let context = zmq::Context::new();
+    let socket = context.socket(zmq::DEALER).map_err(|e| e.to_string())?;
+    socket.set_linger(0).map_err(|e| e.to_string())?;
+    socket.set_rcvtimeo(200).map_err(|e| e.to_string())?;
+    socket.connect(endpoint).map_err(|e| e.to_string())?;
+    socket.send("HI", 0).map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + timeout;
+    let t = tag();
+    let mut greeted = false;
+    while Instant::now() < deadline {
+        let Some(parts) = recv(&socket)? else { continue };
+        match parts.first().map(Vec::as_slice) {
+            Some(b"HELLO") if !greeted => {
+                greeted = true;
+                socket.send_multipart([b"sub.block".to_vec(), t.clone()], 0).map_err(|e| e.to_string())?;
+            }
+            Some(b"REPLY") if parts.get(1) == Some(&t) => {
+                return match parts.get(2).map(Vec::as_slice) {
+                    Some(b"OK") | Some(b"ALREADY") => Ok(()),
+                    other => Err(format!("sub.block refused: {}", String::from_utf8_lossy(other.unwrap_or_default()))),
+                };
+            }
+            Some(b"FORBIDDEN") | Some(b"UNKNOWNCOMMAND") => {
+                return Err(format!("daemon refused the subscription: {}", String::from_utf8_lossy(&parts[0])));
+            }
+            _ => {}
+        }
+    }
+    Err(if greeted { "no reply to sub.block".into() } else { "no HELLO (is this beldexd's OxenMQ socket?)".into() })
+}
+
 fn recv(socket: &zmq::Socket) -> Result<Option<Vec<Vec<u8>>>, String> {
     match socket.recv_multipart(0) {
         Ok(parts) => Ok(Some(parts)),
@@ -244,6 +287,18 @@ mod tests {
         let (mut rx, _) = subscribe(&[endpoint], stop.clone());
         tokio::time::timeout(Duration::from_secs(15), rx.changed()).await.expect("woken after renewal").unwrap();
         stop.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn probes_an_endpoint() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let endpoint = format!("tcp://127.0.0.1:{port}");
+        mock_daemon(&endpoint, 1);
+        probe(&endpoint, Duration::from_secs(5)).unwrap();
+        assert!(probe("tcp://127.0.0.1:1", Duration::from_millis(300)).is_err());
+        assert!(probe("ipc:///nonexistent/beldexd.sock", Duration::from_millis(300))
+            .unwrap_err()
+            .contains("does not exist"));
     }
 
     #[tokio::test]

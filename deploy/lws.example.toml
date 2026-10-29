@@ -1,4 +1,6 @@
-# beldex-lws configuration. Keys are the long option names of `beldex-lws serve`
+# beldex-lws configuration for a larger deployment (PostgreSQL, TLS, two
+# daemons). For a single machine, `beldex-lws setup` writes a config for you.
+# Keys are the long option names of `beldex-lws serve`
 # (see `beldex-lws serve --help`); environment variables (LWS_*) and command-line
 # flags override anything here. Keep the database password in LWS_DATABASE_URL
 # rather than in this file if other users can read it.

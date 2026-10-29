@@ -45,6 +45,8 @@ pub enum Error {
     ChainConflict(u64),
     #[error("unsupported database URL '{0}' (expected postgres://... or sqlite:...)")]
     UnsupportedUrl(String),
+    #[error("{0}")]
+    WrongSealingKey(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -220,6 +222,8 @@ fn request_from_row(sealer: &Sealer, row: &impl Get) -> Result<Request> {
 /// Rows per multi-row INSERT; keeps every statement under SQLite's and
 /// PostgreSQL's bind-parameter limits.
 const INSERT_CHUNK: usize = 400;
+/// lws_meta key (and sealing associated data) of the sealing-key check value.
+const SEAL_CHECK: &str = "seal_check";
 
 #[derive(Clone, Debug)]
 pub struct NewAccount {
@@ -371,6 +375,51 @@ impl Store {
             Some(stored) if stored == configured => Ok(()),
             Some(stored) => Err(Error::NetworkMismatch { stored, configured }),
         }
+    }
+
+    /// Refuses a sealing key that cannot open what the database holds, so a
+    /// server started with the wrong key (another machine's, or none) fails
+    /// at startup instead of on every login. The first start records a check
+    /// value sealed with the current key; `reseal_all` renews it.
+    pub async fn check_sealing_key(&self) -> Result<()> {
+        let wrong = |why: &str| {
+            Error::WrongSealingKey(format!(
+                "{why} (wrong --sealing-key-file? While rotating keys, pass the old one with --sealing-key-old)"
+            ))
+        };
+        const MISMATCH: &str = "the sealing key cannot open this database's view keys";
+        let check = self.get_meta(SEAL_CHECK).await?;
+        if let Some(check) = &check {
+            let stored = hex::decode(check).map_err(|_| Error::Corrupt("sealing check value".into()))?;
+            if stored.len() != 32 {
+                return match self.sealer.open(SEAL_CHECK, &stored) {
+                    Ok(_) => Ok(()),
+                    Err(_) if !self.sealer.is_encrypting() => {
+                        Err(wrong("this database's view keys are encrypted, but no sealing key is configured"))
+                    }
+                    Err(_) => Err(wrong(MISMATCH)),
+                };
+            }
+            // Recorded while keys were stored in plaintext: proves nothing
+            // about a key, so verify a stored key below and upgrade it.
+        }
+        // No usable check value (an older database): try one stored key.
+        let sample = dispatch!(self, pool => {
+            let row = sqlx::query("SELECT address, view_key FROM accounts ORDER BY id DESC LIMIT 1").fetch_optional(pool).await?;
+            row.map(|r| Ok::<_, Error>((r.text("address")?, r.bytes("view_key")?))).transpose()?
+        });
+        if let Some((address, stored)) = sample {
+            self.sealer.open(&address, &stored).map_err(|_| wrong(MISMATCH))?;
+        }
+        if check.is_none() || self.sealer.is_encrypting() {
+            self.write_seal_check().await?;
+        }
+        Ok(())
+    }
+
+    async fn write_seal_check(&self) -> Result<()> {
+        let sealed = self.sealer.seal(SEAL_CHECK, &ViewKey::new([0; 32]))?;
+        self.set_meta(SEAL_CHECK, &hex::encode(sealed)).await
     }
 
     // --------------------------------------------------------------- chain
@@ -623,6 +672,7 @@ impl Store {
             }
             tx.commit().await?;
         });
+        self.write_seal_check().await?;
         Ok(rewritten)
     }
 

@@ -24,6 +24,7 @@ clap.workspace = true
 hex.workspace = true
 lmdb-rkv.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true

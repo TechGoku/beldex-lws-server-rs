@@ -18,8 +18,9 @@ use crate::{open_store, write_secret_file};
 pub struct Common {
     #[command(flatten)]
     pub store: StoreArgs,
-    #[arg(long, env = "LWS_NETWORK", default_value = "main")]
-    pub network: Network,
+    /// main, test or dev. Default: the network the database belongs to.
+    #[arg(long, env = "LWS_NETWORK")]
+    pub network: Option<Network>,
 }
 
 #[derive(Subcommand)]
@@ -162,12 +163,25 @@ fn kind(name: &str) -> RequestKind {
     }
 }
 
-async fn store(common: &Common) -> Result<Store> {
+/// Opens the database and works out its network: --network if given (and
+/// it must match), else the one the database is bound to.
+async fn open(common: &Common) -> Result<(Store, Network)> {
     let mut args = common.store.clone();
     args.resolve()?;
     let store = open_store(&args, args.url(), 2).await?;
-    store.check_network(common.network).await?;
-    Ok(store)
+    store.migrate().await.context("applying migrations")?;
+    let network = match (common.network, store.get_meta("network").await?) {
+        (Some(n), _) => n,
+        (None, Some(stored)) => stored.parse().map_err(anyhow::Error::msg)?,
+        (None, None) => Network::Mainnet,
+    };
+    store.check_network(network).await?;
+    store.check_sealing_key().await?;
+    Ok((store, network))
+}
+
+async fn store(common: &Common) -> Result<Store> {
+    Ok(open(common).await?.0)
 }
 
 async fn add(
@@ -272,12 +286,12 @@ pub async fn run(cmd: AdminCommand) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&rows)?);
         }
         AdminCommand::AddAccount { common, address, view_key, start_height } => {
-            let s = store(&common).await?;
+            let (s, network) = open(&common).await?;
             let start = match start_height {
                 Some(h) => h,
                 None => s.tip().await?.map(|b| b.height).unwrap_or(0),
             };
-            let created = add(&s, common.network, &address, &view_key, start, 0, AccountStatus::Active).await?;
+            let created = add(&s, network, &address, &view_key, start, 0, AccountStatus::Active).await?;
             println!("{}", if created { format!("added, scanning from {start}") } else { "already present".into() });
         }
         AdminCommand::AcceptRequests { common, kind: k, addresses } => {
@@ -305,12 +319,12 @@ pub async fn run(cmd: AdminCommand) -> Result<()> {
             println!("rolled back {} account(s): {} outputs, {} spends removed", r.accounts, r.outputs, r.spends);
         }
         AdminCommand::ExportAccounts { common, out } => {
-            let s = store(&common).await?;
+            let (s, network) = open(&common).await?;
             let accounts = s.list_accounts().await?;
             let doc = ExportDoc {
                 version: 1,
                 exported_at: lws_core::now_secs() as u64,
-                network: short_network(common.network).into(),
+                network: short_network(network).into(),
                 source_height: s.tip().await?.map(|b| b.height).unwrap_or(0),
                 accounts: accounts
                     .iter()
@@ -330,11 +344,11 @@ pub async fn run(cmd: AdminCommand) -> Result<()> {
             eprintln!("wrote {} account(s) to {} -- it contains secret view keys", doc.accounts.len(), out.display());
         }
         AdminCommand::ImportAccounts { common, file } => {
-            let s = store(&common).await?;
+            let (s, network) = open(&common).await?;
             let text = zeroize::Zeroizing::new(std::fs::read_to_string(&file)?);
             let doc: ExportDoc = serde_json::from_str(&text).context("not an account export")?;
-            if doc.network != short_network(common.network) {
-                bail!("export is for network '{}', this server is '{}'", doc.network, short_network(common.network));
+            if doc.network != short_network(network) {
+                bail!("export is for network '{}', this server is '{}'", doc.network, short_network(network));
             }
             let mut created = 0;
             for r in &doc.accounts {
@@ -346,18 +360,17 @@ pub async fn run(cmd: AdminCommand) -> Result<()> {
                 if r.admin {
                     flags |= account_flags::ADMIN;
                 }
-                created +=
-                    usize::from(add(&s, common.network, &r.address, &r.view_key, r.start_height, flags, status).await?);
+                created += usize::from(add(&s, network, &r.address, &r.view_key, r.start_height, flags, status).await?);
             }
             println!("imported {created} of {} account(s); each is rebuilt from its start height", doc.accounts.len());
         }
         AdminCommand::ImportLmdb { common, db_path } => {
-            let s = store(&common).await?;
-            println!("{}", import_lmdb(&s, common.network, &db_path).await?);
+            let (s, network) = open(&common).await?;
+            println!("{}", import_lmdb(&s, network, &db_path).await?);
         }
         AdminCommand::Reseal(c) => {
-            if c.store.sealing_key_file.is_none() {
-                bail!("reseal needs --sealing-key-file (the key to seal with)");
+            if c.store.allow_plaintext_keys {
+                bail!("reseal encrypts with the sealing key; drop --allow-plaintext-keys");
             }
             let n = store(&c).await?.reseal_all().await?;
             println!("re-sealed {n} key(s)");

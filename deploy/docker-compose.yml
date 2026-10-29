@@ -1,51 +1,84 @@
-# A complete testnet stack: PostgreSQL, one API replica and one scanner.
-# Create the secrets first:
-#   mkdir -p secrets && beldex-lws keygen secrets/seal.key && beldex-lws keygen secrets/admin.token
+# The whole server in one command, nothing to prepare:
+#
+#   cp deploy/.env.example deploy/.env      # optional: network, beldexd, domain
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# PostgreSQL, a scanner and the wallet API. Keys are created on the first
+# start in the `keys` volume: back that volume up with the database.
+# With LWS_DOMAIN set, `--profile public` adds Caddy, which fetches a TLS
+# certificate and serves wallets on https://LWS_DOMAIN.
+#
+# Admin commands run inside a container:
+#   docker compose -f deploy/docker-compose.yml exec api beldex-lws admin list-accounts
+#   docker compose -f deploy/docker-compose.yml exec api beldex-lws doctor
+
+x-lws: &lws
+  image: beldex-lws
+  build: { context: .., dockerfile: deploy/Dockerfile }
+  environment:
+    LWS_NETWORK: ${LWS_NETWORK:-main}
+    LWS_DAEMON: ${LWS_DAEMON:-http://host.docker.internal:19091}
+    LWS_NOTIFY: ${LWS_NOTIFY:-}
+    LWS_DATABASE_URL: postgres://lws:${POSTGRES_PASSWORD:-lws}@db/beldex_lws
+    LWS_SEALING_KEY_FILE: /var/lib/beldex-lws/keys/beldex-lws-seal.key
+    LWS_ADMIN_TOKEN_FILE: /var/lib/beldex-lws/keys/beldex-lws-admin.token
+    LWS_ACCOUNT_CREATION: ${LWS_ACCOUNT_CREATION:-auto}
+  volumes: [keys:/var/lib/beldex-lws/keys]
+  extra_hosts: ["host.docker.internal:host-gateway"]
+  restart: unless-stopped
+
 services:
   db:
     image: postgres:16
     environment:
       POSTGRES_USER: lws
-      POSTGRES_PASSWORD: change-me
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lws}
       POSTGRES_DB: beldex_lws
     volumes: [db:/var/lib/postgresql/data]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U lws"]
       interval: 5s
+    restart: unless-stopped
+
+  # Creates the sealing key and admin token once; later starts keep them.
+  keys:
+    <<: *lws
+    entrypoint: ["sh", "-c"]
+    command:
+      - beldex-lws keygen --keep /var/lib/beldex-lws/keys/beldex-lws-seal.key &&
+        beldex-lws keygen --keep /var/lib/beldex-lws/keys/beldex-lws-admin.token
+    restart: "no"
 
   migrate:
-    image: beldex-lws
+    <<: *lws
     command: ["migrate"]
-    environment: &env
-      LWS_DATABASE_URL: postgres://lws:change-me@db/beldex_lws
-      LWS_SEALING_KEY_FILE: /run/secrets/seal.key
-      LWS_NETWORK: test
-      LWS_DAEMON: http://host.docker.internal:29091
-    secrets: [seal.key]
-    depends_on: { db: { condition: service_healthy } }
+    depends_on:
+      db: { condition: service_healthy }
+      keys: { condition: service_completed_successfully }
+    restart: "no"
 
   scanner:
-    image: beldex-lws
+    <<: *lws
     command: ["serve", "--role", "scanner", "--no-migrate"]
-    environment: *env
-    secrets: [seal.key]
     depends_on: { migrate: { condition: service_completed_successfully } }
-    extra_hosts: ["host.docker.internal:host-gateway"]
 
   api:
-    image: beldex-lws
+    <<: *lws
     command: ["serve", "--role", "api", "--no-migrate", "--listen", "0.0.0.0:8443",
-              "--confirm-external-bind", "--admin-listen", "127.0.0.1:8444",
-              "--admin-token-file", "/run/secrets/admin.token"]
-    environment: *env
-    secrets: [seal.key, admin.token]
+              "--confirm-external-bind", "--trust-forwarded-for"]
     ports: ["127.0.0.1:8443:8443"]
     depends_on: { migrate: { condition: service_completed_successfully } }
-    extra_hosts: ["host.docker.internal:host-gateway"]
 
-secrets:
-  seal.key: { file: ./secrets/seal.key }
-  admin.token: { file: ./secrets/admin.token }
+  caddy:
+    image: caddy:2
+    profiles: [public]
+    command: ["caddy", "reverse-proxy", "--from", "${LWS_DOMAIN:-localhost}", "--to", "api:8443"]
+    ports: ["80:80", "443:443"]
+    volumes: [caddy:/data]
+    depends_on: [api]
+    restart: unless-stopped
 
 volumes:
   db:
+  keys:
+  caddy:

@@ -32,3 +32,22 @@ jobs:
           key: ${{ runner.os }}-${{ hashFiles('Cargo.lock', 'kernel/**', '.gitmodules') }}
       - run: make lint
       - run: make test
+
+  # Tagged builds also publish the release archive (bin/, lib/, install.sh).
+  dist:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libboost-all-dev libsodium-dev libssl-dev libsqlite3-dev libzmq3-dev libcurl4-openssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - run: make dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beldex-lws-linux
+          path: dist/*.tar.gz

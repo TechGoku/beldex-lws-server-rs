@@ -1,12 +1,82 @@
 # Operations
 
-## Topologies
+## Installing
 
-**Single machine** (development, small private servers):
+Every way of running it needs a `beldexd` on the same network, reachable over
+RPC (synced, for mainnet).
+
+**Linux server with systemd (recommended).** From a release archive (`make
+dist` builds one) or a source tree after `make release`:
 
 ```bash
-beldex-lws serve --role all --database sqlite:/var/lib/beldex-lws/lws.db ...
+sudo ./install.sh
 ```
+
+It installs to `/opt/beldex-lws`, creates the `beldex-lws` system user, runs
+`beldex-lws setup` (below) to write `/etc/beldex-lws/lws.toml`, starts the
+`beldex-lws` service and runs `doctor`. Options:
+
+| | |
+| --- | --- |
+| `--yes --network test --daemon URL ...` | no questions; any `setup` option is passed on |
+| `--import-lmdb DIR` | also import the accounts of an LMDB server's `--db-path` (stop that server first) |
+| `--no-start` | install and enable, but do not start |
+| `--upgrade` | replace the binaries and restart; config and data stay |
+| `--uninstall` | remove the service and binaries; config and data stay |
+| `--destdir DIR` | stage the files only, for building packages |
+
+`sudo make install ARGS="--yes"` does the same from a source tree.
+
+**Docker.** No files to prepare: keys are created in a volume on first start.
+
+```bash
+cp deploy/.env.example deploy/.env      # network, beldexd address, domain
+docker compose -f deploy/docker-compose.yml up -d
+docker compose -f deploy/docker-compose.yml --profile public up -d   # + Caddy with HTTPS for LWS_DOMAIN
+```
+
+**By hand.** `beldex-lws serve` runs with no configuration at all: it keeps a
+SQLite database, the sealing key and the admin token in its data directory
+(`~/.beldex-lws`, `/var/lib/beldex-lws` as root, or systemd's
+`StateDirectory`), talks to beldexd at the network's default RPC port on this
+machine (19091 main, 29091 test, 39091 dev), and subscribes to that beldexd's
+block announcements when it finds its socket in the usual place
+(`~/.beldex/[testnet/]beldexd.sock` or `/var/lib/beldex/...`).
+
+```bash
+beldex-lws serve --network test        # that is all
+```
+
+### setup
+
+`beldex-lws setup` writes a commented config file and creates the keys. On a
+terminal it asks three questions, each with a default: which beldexd (it
+probes the default ports and takes the network from the daemon it finds),
+which database (SQLite, or a `postgres://` URL it then tests), and how wallets
+reach the server (this machine only, a TLS proxy such as Caddy on this
+machine, or TLS certificates served directly). `--yes` takes the defaults and
+flags without asking. It refuses to overwrite an existing config unless
+`--force` is given.
+
+### doctor
+
+`beldex-lws doctor` takes the same options and config file as `serve` and
+checks, one line each:
+
+- the scan kernel, the config and the key files (permissions and format);
+- the database, and that the sealing key opens its view keys;
+- every beldexd (reachable, right network, synced, has peers, not lagging);
+- the notification socket;
+- the TLS certificate;
+- the listen ports, and a server already running on them (with its scan progress).
+
+It exits non-zero when something would stop the server from working, so it
+also fits scripts and health checks.
+
+## Topologies
+
+**Single machine** (development, small and medium servers): one process,
+SQLite, as `install.sh` sets up.
 
 **Production:**
 
@@ -86,13 +156,21 @@ Hardware defaults:
 
 ## Keys
 
+`setup`, the installer and a first `serve` with SQLite create both keys in the
+data directory (`beldex-lws-seal.key`, `beldex-lws-admin.token`). To make them
+yourself:
+
 ```bash
 beldex-lws keygen /etc/beldex-lws/seal.key      # encrypts view keys at rest
 beldex-lws keygen /etc/beldex-lws/admin.token   # bearer token for the admin API
+beldex-lws keygen --keep FILE                   # only if FILE does not exist yet
 ```
 
 Both files are created with mode 0600, and the server refuses files other
-users can read.
+users can read. With PostgreSQL the sealing key is never created implicitly:
+every server sharing the database needs the same key, so create it once and
+copy it. Each server checks at startup that its key opens the database's view
+keys, and refuses to start otherwise.
 
 - **Back up the sealing key separately from the database.** Without it, the
   stored view keys cannot be opened, although every wallet can still log in
@@ -232,6 +310,18 @@ tokens are never logged.
 
 ## Troubleshooting
 
+Start with `beldex-lws doctor --config /etc/beldex-lws/lws.toml` (as the
+service user): it names most of the problems below directly.
+
+- **`the sealing key cannot open this database's view keys`**: the server was
+  given a different key from the one the database was written with: another
+  machine's, or a regenerated one. Restore the right key file. While rotating,
+  pass the old key with `--sealing-key-old`.
+- **Notifications `off` although beldexd runs here**: the service user cannot
+  open beldexd's socket (permissions, or the systemd unit's `ProtectHome=` when
+  beldexd lives under a home directory). Give the user access, or use
+  `beldexd --lmq-public tcp://127.0.0.1:PORT` with `--notify tcp://127.0.0.1:PORT`.
+  Unix socket paths are limited to 108 bytes.
 - **`refusing to scan: daemon is on 'testnet' ...`**: `--network` and the
   daemon disagree. This is deliberate.
 - **`database belongs to testnet, but the server is configured for mainnet`**:

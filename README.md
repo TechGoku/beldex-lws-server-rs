@@ -36,31 +36,35 @@ REST API is the same, field for field, including privacy tokens (HF22) and
 
 Point `beldex-lws-daemon` at this binary and keep the existing command line,
 config file and `--db-path`. On first start it imports the old accounts and
-rebuilds them from the chain. Wallets and admin tools keep working. See
+rebuilds them from the chain. Wallets and admin tools keep working. Or
+install it fresh as a service and bring the accounts along with
+`sudo ./deploy/install.sh --import-lmdb <old --db-path>`. See
 [docs/OPERATIONS.md](docs/OPERATIONS.md#migrating-from-the-lmdb-server).
 
-## Quick start (SQLite, testnet)
+## Quick start
 
 ```bash
 git clone --recursive <this repo> && cd beldex-lws-scalable
-make release                      # builds beldex core, the kernel and the server
-
-./target/release/beldex-lws keygen /etc/beldex-lws/seal.key
-./target/release/beldex-lws keygen /etc/beldex-lws/admin.token
-
-export LWS_DATABASE_URL=sqlite:/var/lib/beldex-lws/lws.db
-export LWS_SEALING_KEY_FILE=/etc/beldex-lws/seal.key
-./target/release/beldex-lws serve \
-    --network test \
-    --daemon http://127.0.0.1:29091 \
-    --admin-token-file /etc/beldex-lws/admin.token
+make release                 # builds beldex core, the kernel and the server
+sudo ./deploy/install.sh     # installs, configures and starts the systemd service
 ```
 
-The wallet API listens on `127.0.0.1:8443` and the admin API on
-`127.0.0.1:8444`. Wallets register themselves through `/login`.
+The installer finds the local beldexd (and with it the network), asks how
+wallets will connect, creates the keys and starts the service. Then it checks
+everything with `beldex-lws doctor`. With Docker instead:
 
-For production (PostgreSQL, TLS, several API replicas, sharded scanners),
-see [docs/OPERATIONS.md](docs/OPERATIONS.md).
+```bash
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+To try it without installing anything, run `./target/release/beldex-lws serve
+--network test`. It needs no config file: it keeps its database and keys in
+`~/.beldex-lws` and finds beldexd at its default port.
+
+Wallets connect to `127.0.0.1:8443`, and the admin API listens on
+`127.0.0.1:8444`. Wallets register themselves through `/login`. For a public
+server, a TLS proxy, PostgreSQL, several API replicas or sharded scanners, see
+[docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## Requirements
 
@@ -80,8 +84,8 @@ see [docs/OPERATIONS.md](docs/OPERATIONS.md).
 | `crates/lws-daemon` | `beldexd` client with failover and the epee binary codec |
 | `crates/lws-scanner` | Chain scanner |
 | `crates/lws-api` | Wallet REST API and admin API |
-| `crates/beldex-lws` | The binary: `serve`, `migrate`, `admin`, `keygen` |
-| `deploy/` | systemd units, Dockerfile, compose file, example config |
+| `crates/beldex-lws` | The binary: `serve`, `setup`, `doctor`, `migrate`, `admin`, `keygen` |
+| `deploy/` | installer, systemd unit, Dockerfile, compose file, example config |
 
 ## Tests
 

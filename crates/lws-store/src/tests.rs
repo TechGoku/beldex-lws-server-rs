@@ -311,3 +311,40 @@ async fn reseal_rotates_every_key() {
     assert!(old.account_by_id(a.id).await.is_err(), "old key alone can no longer open it");
     let _ = std::fs::remove_file(&path);
 }
+
+#[tokio::test]
+async fn a_wrong_sealing_key_is_refused_at_startup() {
+    let path = std::env::temp_dir().join(format!("lws-store-sealcheck-{}.db", std::process::id()));
+    let url = format!("sqlite:{}", path.display());
+    let first = Store::connect(&url, 2, Sealer::new((1, &[1; 32]), &[])).await.unwrap();
+    first.migrate().await.unwrap();
+    created(&first, 5, 0).await;
+    first.check_sealing_key().await.unwrap();
+    first.check_sealing_key().await.unwrap();
+
+    let other = Store::connect(&url, 2, Sealer::new((1, &[9; 32]), &[])).await.unwrap();
+    assert!(matches!(other.check_sealing_key().await, Err(Error::WrongSealingKey(_))));
+    let none = Store::connect(&url, 2, Sealer::plaintext()).await.unwrap();
+    assert!(matches!(none.check_sealing_key().await, Err(Error::WrongSealingKey(_))));
+
+    // After a rotation the new key alone passes.
+    let rotating = Store::connect(&url, 2, Sealer::new((2, &[2; 32]), &[(1, [1; 32])])).await.unwrap();
+    rotating.check_sealing_key().await.unwrap();
+    rotating.reseal_all().await.unwrap();
+    let rotated = Store::connect(&url, 2, Sealer::new((2, &[2; 32]), &[])).await.unwrap();
+    rotated.check_sealing_key().await.unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn databases_from_before_the_check_are_verified_by_their_accounts() {
+    let path = std::env::temp_dir().join(format!("lws-store-sealcheck-old-{}.db", std::process::id()));
+    let url = format!("sqlite:{}", path.display());
+    let first = Store::connect(&url, 2, Sealer::new((1, &[1; 32]), &[])).await.unwrap();
+    first.migrate().await.unwrap();
+    created(&first, 6, 0).await;
+    let wrong = Store::connect(&url, 2, Sealer::new((1, &[9; 32]), &[])).await.unwrap();
+    assert!(wrong.check_sealing_key().await.is_err());
+    first.check_sealing_key().await.unwrap();
+    let _ = std::fs::remove_file(&path);
+}

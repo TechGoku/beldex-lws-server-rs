@@ -27,19 +27,109 @@ pub enum Role {
     Scanner,
 }
 
+pub const SQLITE_FILE: &str = "beldex-lws.sqlite";
+pub const SEALING_KEY_FILE: &str = "beldex-lws-seal.key";
+pub const ADMIN_TOKEN_FILE: &str = "beldex-lws-admin.token";
+
+#[cfg(unix)]
+extern "C" {
+    fn geteuid() -> u32;
+}
+
+pub fn is_root() -> bool {
+    #[cfg(unix)]
+    return unsafe { geteuid() } == 0;
+    #[cfg(not(unix))]
+    false
+}
+
+/// $STATE_DIRECTORY (systemd's StateDirectory=), /var/lib/beldex-lws as
+/// root, else ~/.beldex-lws.
+pub fn default_data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("STATE_DIRECTORY") {
+        let dir = dir.to_string_lossy().split(':').next().unwrap_or_default().to_owned();
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    match std::env::var_os("HOME") {
+        Some(home) if !is_root() => PathBuf::from(home).join(".beldex-lws"),
+        _ => PathBuf::from("/var/lib/beldex-lws"),
+    }
+}
+
+/// Writes a new random 32-byte hex key to `path` (mode 0600).
+pub fn write_new_key(path: &std::path::Path) -> Result<()> {
+    let mut secret = zeroize::Zeroizing::new([0u8; 32]);
+    rand::RngCore::fill_bytes(&mut rand::rng(), secret.as_mut());
+    let text = zeroize::Zeroizing::new(format!("{}\n", hex::encode(secret.as_ref())));
+    crate::write_secret_file(path, text.as_bytes())
+}
+
+/// beldexd's default RPC address for a network.
+pub fn default_daemon(network: Network) -> String {
+    let port = match network {
+        Network::Mainnet => 19091,
+        Network::Testnet => 29091,
+        Network::Devnet => 39091,
+    };
+    format!("http://127.0.0.1:{port}")
+}
+
+/// Where a beldexd on this machine keeps its OxenMQ socket, for `network`.
+pub fn local_notify_sockets(network: Network) -> Vec<PathBuf> {
+    let sub = match network {
+        Network::Mainnet => "",
+        Network::Testnet => "testnet",
+        Network::Devnet => "devnet",
+    };
+    let mut roots = vec![PathBuf::from("/var/lib/beldex"), PathBuf::from("/var/lib/beldexd")];
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.insert(0, PathBuf::from(home).join(".beldex"));
+    }
+    roots.into_iter().map(|r| r.join(sub).join("beldexd.sock")).collect()
+}
+
+/// The first local beldexd socket this process can connect to.
+pub fn detect_notify_socket(network: Network) -> Option<String> {
+    #[cfg(unix)]
+    for path in local_notify_sockets(network) {
+        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            return Some(format!("ipc://{}", path.display()));
+        }
+    }
+    None
+}
+
+fn is_local_url(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let host = rest.split(['/', '?']).next().unwrap_or_default();
+    let host = host.rsplit_once(':').filter(|(h, p)| !p.contains(']') && !h.is_empty()).map_or(host, |(h, _)| h);
+    matches!(host.trim_matches(['[', ']']), "127.0.0.1" | "localhost" | "::1")
+}
+
 #[derive(Args, Clone, Debug)]
 pub struct StoreArgs {
     /// postgres://user:pass@host/db or sqlite:/var/lib/beldex-lws/lws.db.
     /// Prefer the environment variable: a command line is visible to every user.
-    /// Defaults to a SQLite database inside --db-path when that is given.
+    /// Default: a SQLite database in the data directory.
     #[arg(long, env = "LWS_DATABASE_URL")]
     pub database: Option<String>,
-    /// The LMDB server's database directory. Without --database, this server
-    /// keeps its own SQLite database and sealing key there, and on first start
-    /// imports the accounts of the LMDB database it finds there.
+    /// Where this server keeps its own files: the SQLite database, sealing
+    /// key and admin token, unless configured elsewhere. Default:
+    /// $STATE_DIRECTORY under systemd, /var/lib/beldex-lws as root, else
+    /// ~/.beldex-lws.
+    #[arg(long, env = "LWS_DATA_DIR")]
+    pub data_dir: Option<PathBuf>,
+    /// The LMDB server's database directory. Used as the data directory, and
+    /// on first start the accounts of the LMDB database found there are
+    /// imported.
     #[arg(long, env = "LWS_DB_PATH")]
     pub db_path: Option<PathBuf>,
     /// File holding the 32-byte hex key that encrypts view keys at rest.
+    /// Default: beldex-lws-seal.key in the data directory, created on first
+    /// use with SQLite. Every server sharing a PostgreSQL database needs the
+    /// same key, so with PostgreSQL it is never created implicitly.
     #[arg(long, env = "LWS_SEALING_KEY_FILE")]
     pub sealing_key_file: Option<PathBuf>,
     /// Id recorded with keys sealed under --sealing-key-file (0-255).
@@ -54,24 +144,32 @@ pub struct StoreArgs {
 }
 
 impl StoreArgs {
-    /// Fills in defaults derived from --db-path. Creates the sealing key file
-    /// there (0600) on first use.
+    /// The data directory: --db-path, else --data-dir, else the default.
+    pub fn dir(&self) -> PathBuf {
+        self.db_path.clone().or_else(|| self.data_dir.clone()).unwrap_or_else(default_data_dir)
+    }
+
+    /// Fills in the database and sealing key defaults from the data
+    /// directory, creating the directory and (with SQLite) the sealing key
+    /// on first use.
     pub fn resolve(&mut self) -> Result<()> {
-        if self.database.is_some() {
-            return Ok(());
+        let dir = self.dir();
+        if self.database.is_none() {
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            self.database = Some(format!("sqlite:{}", dir.join(SQLITE_FILE).display()));
         }
-        let Some(dir) = &self.db_path else {
-            bail!("--database is required (or --db-path, to run in the LMDB server's directory)");
-        };
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        self.database = Some(format!("sqlite:{}", dir.join("beldex-lws.sqlite").display()));
         if self.sealing_key_file.is_none() && !self.allow_plaintext_keys {
-            let key = dir.join("beldex-lws-seal.key");
+            let key = dir.join(SEALING_KEY_FILE);
             if !key.exists() {
-                let mut secret = zeroize::Zeroizing::new([0u8; 32]);
-                rand::RngCore::fill_bytes(&mut rand::rng(), secret.as_mut());
-                crate::write_secret_file(&key, format!("{}\n", hex::encode(secret.as_ref())).as_bytes())?;
-                tracing::warn!(path = %key.display(), "created a sealing key next to the database; back it up, and consider moving it elsewhere (--sealing-key-file)");
+                if !self.url().starts_with("sqlite:") {
+                    bail!(
+                        "--sealing-key-file is required with PostgreSQL: every server sharing the database \
+                         needs the same key. Create it once with `beldex-lws keygen FILE` and copy it to each server"
+                    );
+                }
+                std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+                write_new_key(&key)?;
+                tracing::warn!(path = %key.display(), "created the sealing key that encrypts view keys; back it up with the database");
             }
             self.sealing_key_file = Some(key);
         }
@@ -105,7 +203,9 @@ pub struct ServeArgs {
     pub no_migrate: bool,
 
     /// beldexd RPC endpoints, primary first, comma-separated or repeated.
-    #[arg(long, env = "LWS_DAEMON", value_delimiter = ',', default_value = "http://127.0.0.1:19091")]
+    /// Default: beldexd on this machine at the network's RPC port
+    /// (19091 main, 29091 test, 39091 dev).
+    #[arg(long, env = "LWS_DAEMON", value_delimiter = ',')]
     pub daemon: Vec<String>,
     /// Seconds before an ordinary daemon call is abandoned.
     #[arg(long, env = "LWS_DAEMON_TIMEOUT", default_value_t = 15)]
@@ -128,7 +228,8 @@ pub struct ServeArgs {
     /// Defaults to 127.0.0.1:8444, unless the wallet API uses port 8444.
     #[arg(long, env = "LWS_ADMIN_LISTEN")]
     pub admin_listen: Option<SocketAddr>,
-    /// File holding the bearer token for admin routes.
+    /// File holding the bearer token for admin routes. Default:
+    /// beldex-lws-admin.token in the data directory, created on first start.
     #[arg(long, env = "LWS_ADMIN_TOKEN_FILE")]
     pub admin_token_file: Option<PathBuf>,
 
@@ -191,8 +292,13 @@ pub struct ServeArgs {
     /// e.g. ipc:///var/lib/beldex/beldexd.sock or tcp://10.0.0.1:20202
     /// (beldexd --lmq-public). The scanner then reacts to a new block at once
     /// instead of at the next poll. Repeatable; same as the LMDB server's --sub.
+    /// Default: beldexd's socket in its usual data directory, when a daemon
+    /// runs on this machine and the socket accepts connections.
     #[arg(long = "notify", alias = "sub", env = "LWS_NOTIFY", value_delimiter = ',')]
     pub notify: Vec<String>,
+    /// Do not look for beldexd's socket; rely on polling alone.
+    #[arg(long, env = "LWS_NO_NOTIFY", value_parser = BoolishValueParser::new())]
+    pub no_notify: bool,
     /// Download full transactions instead of pruned ones.
     #[arg(long, env = "LWS_NO_PRUNE", value_parser = BoolishValueParser::new())]
     pub no_prune: bool,
@@ -302,6 +408,9 @@ impl ServeArgs {
             }
             self.admin_listen = Some(addr);
         }
+        if self.daemon.is_empty() && !legacy.daemon_backup.is_empty() {
+            self.daemon.push(default_daemon(self.network));
+        }
         self.daemon.extend(legacy.daemon_backup);
         if let Some(bytes) = legacy.rest_max_response_bytes {
             self.max_response_mb = bytes.div_ceil(1024 * 1024);
@@ -368,7 +477,42 @@ impl ServeArgs {
     }
 
     pub fn daemon_urls(&self) -> Vec<String> {
-        self.daemon.iter().map(|d| d.trim().to_owned()).filter(|d| !d.is_empty()).collect()
+        let urls: Vec<String> = self.daemon.iter().map(|d| d.trim().to_owned()).filter(|d| !d.is_empty()).collect();
+        if urls.is_empty() {
+            vec![default_daemon(self.network)]
+        } else {
+            urls
+        }
+    }
+
+    /// OxenMQ endpoints for block notifications: --notify, else a local
+    /// beldexd's socket when one of the daemons runs on this machine.
+    /// The bool says whether the endpoint was found automatically.
+    pub fn notify_endpoints(&self) -> (Vec<String>, bool) {
+        let given: Vec<String> = self.notify.iter().map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()).collect();
+        if !given.is_empty() || self.no_notify || !self.daemon_urls().iter().any(|d| is_local_url(d)) {
+            return (given, false);
+        }
+        match detect_notify_socket(self.network) {
+            Some(found) => (vec![found], true),
+            None => (Vec::new(), false),
+        }
+    }
+
+    /// The admin token file, created in the data directory if none is
+    /// configured and it does not exist yet.
+    pub fn admin_token_path(&self) -> Result<PathBuf> {
+        if let Some(path) = &self.admin_token_file {
+            return Ok(path.clone());
+        }
+        let dir = self.store.dir();
+        let path = dir.join(ADMIN_TOKEN_FILE);
+        if !path.exists() {
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            write_new_key(&path)?;
+            tracing::info!(path = %path.display(), "created the admin API token");
+        }
+        Ok(path)
     }
 
     pub fn shard(&self) -> Result<Option<(u32, u32)>> {
@@ -477,6 +621,16 @@ mod tests {
         assert_eq!(parse_rest_url("http://127.0.0.1").unwrap().0.port(), 8080);
         assert_eq!(parse_rest_url("http://[::1]:9000/admin").unwrap().0, "[::1]:9000".parse().unwrap());
         assert!(parse_rest_url("ftp://x:1").is_err());
+    }
+
+    #[test]
+    fn local_daemon_urls() {
+        for url in ["http://127.0.0.1:19091", "localhost:29091", "http://[::1]:19091/", "http://localhost"] {
+            assert!(is_local_url(url), "{url}");
+        }
+        for url in ["http://10.0.0.2:19091", "https://node.example:443", "http://127.0.0.2:1"] {
+            assert!(!is_local_url(url), "{url}");
+        }
     }
 
     #[test]

@@ -1,4 +1,5 @@
 # Build:  docker build -f deploy/Dockerfile -t beldex-lws .
+# Or let deploy/docker-compose.yml build it.
 FROM ubuntu:24.04 AS build
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       build-essential cmake ninja-build pkg-config git ca-certificates curl \
@@ -14,9 +15,11 @@ FROM ubuntu:24.04
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       ca-certificates libsodium23 libzmq5 libboost-serialization1.83.0 libboost-program-options1.83.0 \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --home /var/lib/beldex-lws --create-home beldex-lws
+    && useradd --system --home /var/lib/beldex-lws --create-home beldex-lws \
+    && install -d -o beldex-lws -g beldex-lws -m 0700 /var/lib/beldex-lws/keys
 COPY --from=build /src/dist/beldex-lws-*/bin /opt/beldex-lws/bin
 COPY --from=build /src/dist/beldex-lws-*/lib /opt/beldex-lws/lib
+ENV PATH=/opt/beldex-lws/bin:$PATH LWS_DATA_DIR=/var/lib/beldex-lws
 USER beldex-lws
 EXPOSE 8443 8444
 ENTRYPOINT ["/opt/beldex-lws/bin/beldex-lws"]

@@ -253,6 +253,7 @@ dependencies = [
  "lws-store",
  "rand 0.9.5",
  "rayon",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",
@@ -1453,6 +1454,7 @@ name = "lws-store"
 version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
+ "hex",
  "lws-core",
  "sqlx",
  "thiserror",
