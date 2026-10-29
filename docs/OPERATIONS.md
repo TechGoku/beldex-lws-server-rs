@@ -35,6 +35,8 @@ docker compose -f deploy/docker-compose.yml up -d
 docker compose -f deploy/docker-compose.yml --profile public up -d   # + Caddy with HTTPS for LWS_DOMAIN
 ```
 
+The dashboard is then on `http://127.0.0.1:8444/` of the host.
+
 **By hand.** `beldex-lws serve` runs with no configuration at all: it keeps a
 SQLite database, the sealing key and the admin token in its data directory
 (`~/.beldex-lws`, `/var/lib/beldex-lws` as root, or systemd's
@@ -57,6 +59,15 @@ reach the server (this machine only, a TLS proxy such as Caddy on this
 machine, or TLS certificates served directly). `--yes` takes the defaults and
 flags without asking. It refuses to overwrite an existing config unless
 `--force` is given.
+
+### setup in a browser
+
+`beldex-lws setup --web` (or `sudo ./install.sh --web`) asks the same
+questions in a browser, with buttons that test the daemon, the database and
+the TLS files before anything is written. It listens on `127.0.0.1:8445` only
+and prints a one-time link; on a remote server, forward the port first
+(`ssh -L 8445:127.0.0.1:8445 server`) and open the link locally. It stops once
+the configuration is written.
 
 ### doctor
 
@@ -292,11 +303,50 @@ LMDB lock format differs from this reader's, so it reads without locks.
 Either way, run the new server alongside the old one until it reaches the tip
 (`beldex_lws_min_scan_height` in the metrics), then switch the load balancer.
 
+## Dashboard
+
+The admin listener serves a web dashboard at `/` (default
+`http://127.0.0.1:8444/`). Sign in with the admin token
+(`beldex-lws-admin.token` in the data directory). From another machine,
+forward the port: `ssh -L 8444:127.0.0.1:8444 server`.
+
+- **Overview:** health, accounts, scanner lag, chain height, requests per
+  second, p50/p95 latency, error and shed rates, live charts, every beldexd
+  with its height and errors, scanning and database details.
+- **Accounts:** search by address prefix, filter by status or "behind",
+  page through millions of accounts, see one in detail, add, activate,
+  deactivate, hide, or rescan (one account or a selection).
+- **Requests:** approve or reject pending account creations and imports.
+- **Cluster:** every process of the deployment (API replicas and scanners)
+  with its version, uptime, last report and key numbers, and which scanner
+  holds each shard. Processes report every 10 seconds through the database.
+- **Audit log:** every change made through the dashboard, the admin API or
+  `beldex-lws admin`, with who made it and from where. Entries are kept for
+  `--audit-retention-days` (365; 0 keeps everything).
+- **Settings:** the effective configuration, without secrets.
+
+The page loads nothing from other sites and runs under a strict
+Content-Security-Policy. The token stays in the tab's memory (or its session
+storage, with "stay signed in"), is sent as a bearer token, and no cookies
+are used. Values from the server are only ever inserted as text.
+
+Scanner-only processes (`--role scanner`) serve `/metrics`, `/health` and
+`/ready` on their admin listener, so every process can be scraped.
+
 ## Monitoring
+
+`deploy/monitoring/` has a Prometheus scrape example, alert rules
+(`alerts.yml`: process down, scanner behind or stalled, scan errors, 5xx
+ratio, p95 latency, load shedding, lost block notifications, restart loops)
+and a Grafana dashboard (`grafana-dashboard.json`; import it and pick the
+Prometheus data source).
 
 The admin listener serves:
 
-- `GET /metrics`: Prometheus. Alert on:
+- `GET /metrics`: Prometheus, including latency histograms
+  (`http_request_duration_seconds`, `scan_batch_duration_seconds`,
+  `daemon_fetch_duration_seconds`), `build_info` and
+  `process_start_time_seconds`. Alert on:
   - `beldex_lws_daemon_height - beldex_lws_min_scan_height` growing (scanner falling behind);
   - `scan_errors_total` rising;
   - `http_server_errors_total` and `http_shed_total` rising (add API replicas);

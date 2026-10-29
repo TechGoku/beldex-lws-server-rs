@@ -9,6 +9,7 @@ mod admin_cli;
 mod legacy;
 mod settings;
 mod setup;
+mod setup_web;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -42,7 +43,8 @@ enum Command {
     /// Run the server (API, scanner, or both).
     Serve(Box<ServeArgs>),
     /// Write a working configuration: finds beldexd, creates the keys and
-    /// the config file. Asks before each choice on a terminal.
+    /// the config file. Asks before each choice on a terminal, or in a
+    /// browser with --web.
     #[command(alias = "init")]
     Setup(Box<setup::SetupArgs>),
     /// Check an installation (config, keys, database, beldexd, TLS, ports)
@@ -221,6 +223,7 @@ async fn serve(mut args: ServeArgs) -> Result<()> {
         Duration::from_secs(args.blocks_timeout),
     )?);
     let metrics = Arc::new(Metrics::default());
+    let instance = args.instance_name();
     let (stop_tx, stop_rx) = watch::channel(false);
     tokio::spawn(shutdown_signal(stop_tx));
 
@@ -276,7 +279,7 @@ async fn serve(mut args: ServeArgs) -> Result<()> {
             accounts_per_task: 256,
             fast_prefilter: !args.no_fast_scan,
             lease_ttl: Duration::from_secs(30),
-            instance: args.instance_name(),
+            instance: instance.clone(),
         };
         info!(threads, shard = ?config.shard, "starting scanner");
         let mut scanner = lws_scanner::Scanner::new(primary.clone(), daemon.clone(), metrics.clone(), config, threads)?;
@@ -307,10 +310,27 @@ async fn serve(mut args: ServeArgs) -> Result<()> {
         tasks.spawn(serve_http("wallet API", lws_api::public_router(state.clone()), args.listen, tls, stop_rx.clone()));
 
         let token = Some(read_secret_file(&args.admin_token_path()?)?.as_bytes().to_vec());
+        let info = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "instance": instance,
+            "role": format!("{:?}", args.role).to_lowercase(),
+            "network": args.network.daemon_name(),
+            "database": primary.backend(),
+            "read_replica": args.database_read.is_some(),
+            "wallet_api": args.listen.to_string(),
+            "tls": args.tls_cert.is_some(),
+            "admin_api": args.admin_addr().map(|a| a.to_string()),
+            "daemons": daemon.endpoint_count(),
+            "notifications": !notify.is_empty(),
+            "started_at": metrics.started_at,
+        });
         match args.admin_addr() {
             Some(addr) => {
-                let admin =
-                    lws_api::admin::admin_router(Arc::new(lws_api::admin::AdminState { app: state.clone(), token }));
+                let admin = lws_api::admin::admin_router(Arc::new(lws_api::admin::AdminState {
+                    app: state.clone(),
+                    token,
+                    info,
+                }));
                 tasks.spawn(serve_http("admin API", admin, addr, None, stop_rx.clone()));
             }
             None => warn!("admin API off: the wallet API uses port 8444; pass --admin-listen to enable it"),
@@ -318,6 +338,49 @@ async fn serve(mut args: ServeArgs) -> Result<()> {
         let rx = stop_rx.clone();
         tasks.spawn(async move {
             lws_api::maintenance(state, rx).await;
+            Ok(())
+        });
+    }
+
+    if args.role == Role::Scanner {
+        if let Some(addr) = args.admin_addr() {
+            let ops = lws_api::admin::ops_router(metrics.clone(), primary.clone(), daemon.clone());
+            tasks.spawn(serve_http("metrics", ops, addr, None, stop_rx.clone()));
+        }
+    }
+
+    // Every process reports in, so the dashboard shows the whole deployment.
+    {
+        let (store, m, mut stop) = (primary.clone(), metrics.clone(), stop_rx.clone());
+        let (name, role) = (instance.clone(), format!("{:?}", args.role).to_lowercase());
+        let retention = args.audit_retention_days;
+        tasks.spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            let mut beats = 0u64;
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = stop.changed() => break,
+                }
+                let stats = m.snapshot().to_string();
+                if let Err(e) = store.heartbeat(&name, &role, env!("CARGO_PKG_VERSION"), m.started_at, &stats).await {
+                    warn!(error = %e, "could not record the heartbeat");
+                }
+                // Hourly housekeeping.
+                if beats.is_multiple_of(360) {
+                    let now = lws_core::now_secs();
+                    let _ = store.remove_instances(now - 24 * 3600, None).await;
+                    if retention > 0 {
+                        match store.prune_audit(now - retention as i64 * 86400).await {
+                            Ok(n) if n > 0 => info!(removed = n, "pruned old audit entries"),
+                            Ok(_) => {}
+                            Err(e) => warn!(error = %e, "could not prune the audit log"),
+                        }
+                    }
+                }
+                beats += 1;
+            }
+            let _ = store.remove_instances(0, Some(&name)).await;
             Ok(())
         });
     }

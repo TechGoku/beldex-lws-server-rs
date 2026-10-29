@@ -348,3 +348,81 @@ async fn databases_from_before_the_check_are_verified_by_their_accounts() {
     first.check_sealing_key().await.unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+#[tokio::test]
+async fn account_pages_search_and_counts() {
+    for store in backends().await {
+        for n in 1..=25 {
+            created(&store, n, u64::from(n) * 10).await;
+        }
+        store.set_status(&["address-3".into(), "address-4".into()], AccountStatus::Inactive).await.unwrap();
+        store.set_status(&["address-5".into()], AccountStatus::Hidden).await.unwrap();
+
+        let first = store.account_page(&AccountFilter { limit: 10, ..Default::default() }).await.unwrap();
+        assert_eq!(first.len(), 10);
+        assert_eq!(first[0].address, "address-25", "newest first");
+        let second = store
+            .account_page(&AccountFilter { limit: 10, before_id: Some(first[9].id), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(second[0].id, first[9].id - 1);
+
+        let inactive = store
+            .account_page(&AccountFilter { status: Some(AccountStatus::Inactive), limit: 50, ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(inactive.len(), 2);
+
+        // Prefix search, with LIKE wildcards taken literally.
+        let found = store
+            .account_page(&AccountFilter { search: Some("address-2".into()), limit: 50, ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 7, "address-2 and address-20..25");
+        let none = store
+            .account_page(&AccountFilter { search: Some("address_%".into()), limit: 50, ..Default::default() })
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+
+        let behind = store
+            .account_page(&AccountFilter { scanned_below: Some(50), limit: 50, ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(behind.len(), 4, "start heights 10..40");
+
+        let c = store.account_counts(100).await.unwrap();
+        assert_eq!((c.active, c.inactive, c.hidden), (22, 2, 1));
+        assert_eq!(c.active_behind, 6, "active accounts scanned below 100: 1, 2, 6..9");
+
+        let one = store.account_summary("address-7").await.unwrap().unwrap();
+        assert_eq!(one.scan_height, 70);
+        assert_eq!(store.account_activity(one.id).await.unwrap(), (0, 0));
+    }
+}
+
+#[tokio::test]
+async fn audit_trail_and_instances() {
+    for store in backends().await {
+        store.record_audit("token", "127.0.0.1", "rescan", "{\"height\":5}").await.unwrap();
+        store.record_audit("cli:root", "local", "set_status", "{}").await.unwrap();
+        let log = store.audit_log(None, 10).await.unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].action, "set_status");
+        assert_eq!(store.audit_log(Some(log[0].id), 10).await.unwrap().len(), 1);
+        assert_eq!(store.prune_audit(lws_core::now_secs() + 1).await.unwrap(), 2);
+
+        store.heartbeat("api-1", "api", "0.1.0", 100, "{\"x\":1}").await.unwrap();
+        store.heartbeat("api-1", "api", "0.1.0", 100, "{\"x\":2}").await.unwrap();
+        store.heartbeat("scan-1", "scanner", "0.1.0", 100, "{}").await.unwrap();
+        let live = store.instances(0).await.unwrap();
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[0].stats, "{\"x\":2}");
+        store.remove_instances(0, Some("api-1")).await.unwrap();
+        assert_eq!(store.instances(0).await.unwrap().len(), 1);
+        assert!(store.instances(lws_core::now_secs() + 10).await.unwrap().is_empty());
+
+        assert!(store.acquire_lease("scanner-0-of-1", "scan-1", Duration::from_secs(30)).await.unwrap());
+        assert_eq!(store.leases().await.unwrap()[0].holder, "scan-1");
+    }
+}

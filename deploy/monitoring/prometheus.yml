@@ -1,0 +1,14 @@
+# Scrape every beldex-lws process: API replicas and scanners alike serve
+# /metrics on their admin listener (default 127.0.0.1:8444; give each one a
+# private --admin-listen address Prometheus can reach).
+scrape_configs:
+  - job_name: beldex-lws
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["10.0.0.11:8444", "10.0.0.12:8444"]   # API replicas
+        labels: { role: api }
+      - targets: ["10.0.0.21:8444"]                     # scanners
+        labels: { role: scanner }
+
+rule_files:
+  - alerts.yml

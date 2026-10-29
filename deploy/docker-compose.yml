@@ -8,6 +8,9 @@
 # With LWS_DOMAIN set, `--profile public` adds Caddy, which fetches a TLS
 # certificate and serves wallets on https://LWS_DOMAIN.
 #
+# Dashboard: http://127.0.0.1:8444/ on the host. The admin token:
+#   docker compose -f deploy/docker-compose.yml exec api cat /var/lib/beldex-lws/keys/beldex-lws-admin.token
+#
 # Admin commands run inside a container:
 #   docker compose -f deploy/docker-compose.yml exec api beldex-lws admin list-accounts
 #   docker compose -f deploy/docker-compose.yml exec api beldex-lws doctor
@@ -59,14 +62,17 @@ services:
 
   scanner:
     <<: *lws
-    command: ["serve", "--role", "scanner", "--no-migrate"]
+    # Metrics on scanner:8444 inside the compose network (not published).
+    command: ["serve", "--role", "scanner", "--no-migrate", "--admin-listen", "0.0.0.0:8444", "--admin-any-interface"]
     depends_on: { migrate: { condition: service_completed_successfully } }
 
   api:
     <<: *lws
     command: ["serve", "--role", "api", "--no-migrate", "--listen", "0.0.0.0:8443",
-              "--confirm-external-bind", "--trust-forwarded-for"]
-    ports: ["127.0.0.1:8443:8443"]
+              "--confirm-external-bind", "--trust-forwarded-for",
+              "--admin-listen", "0.0.0.0:8444", "--admin-any-interface"]
+    # Wallet API, and the dashboard on http://127.0.0.1:8444/ of the host only.
+    ports: ["127.0.0.1:8443:8443", "127.0.0.1:8444:8444"]
     depends_on: { migrate: { condition: service_completed_successfully } }
 
   caddy:

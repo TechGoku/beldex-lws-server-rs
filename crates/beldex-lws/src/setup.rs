@@ -59,6 +59,12 @@ pub struct SetupArgs {
     /// Replace an existing config file.
     #[arg(long)]
     pub force: bool,
+    /// Set up in a web browser instead of the terminal.
+    #[arg(long)]
+    pub web: bool,
+    /// Where the browser setup listens (loopback only).
+    #[arg(long, default_value = "127.0.0.1:8445")]
+    pub web_listen: SocketAddr,
 }
 
 struct Prompt {
@@ -80,13 +86,13 @@ impl Prompt {
 }
 
 /// get_info from one endpoint, with a short timeout.
-async fn probe_daemon(url: &str) -> lws_daemon::Result<lws_daemon::Info> {
+pub async fn probe_daemon(url: &str) -> lws_daemon::Result<lws_daemon::Info> {
     Daemon::new(&[url.to_owned()], Duration::from_secs(4), Duration::from_secs(4))?.get_info().await
 }
 
 /// The first daemon among `urls` (or the default ports) that answers, and
 /// the network it runs.
-async fn find_daemon(urls: &[String], network: Option<Network>) -> Option<(String, Network, lws_daemon::Info)> {
+pub async fn find_daemon(urls: &[String], network: Option<Network>) -> Option<(String, Network, lws_daemon::Info)> {
     let candidates: Vec<String> = if !urls.is_empty() {
         urls.to_vec()
     } else {
@@ -110,6 +116,9 @@ fn toml_str(s: &str) -> String {
 }
 
 pub async fn setup(args: SetupArgs) -> Result<()> {
+    if args.web {
+        return crate::setup_web::run(args).await;
+    }
     lws_kernel::self_check().context("the scan kernel failed its self-check; reinstall the server")?;
     let prompt = Prompt { interactive: !args.yes && std::io::stdin().is_terminal() };
     if prompt.interactive {
@@ -169,12 +178,7 @@ pub async fn setup(args: SetupArgs) -> Result<()> {
         }
     };
     if let Some(url) = &database {
-        if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
-            bail!("{url}: expected a postgres:// URL");
-        }
-        let store = Store::connect(url, 2, Sealer::plaintext()).await.context("connecting to PostgreSQL")?;
-        store.ping().await?;
-        store.close().await;
+        check_database(url).await?;
         eprintln!("PostgreSQL is reachable.");
     }
 
@@ -200,29 +204,127 @@ pub async fn setup(args: SetupArgs) -> Result<()> {
             _ => ("127.0.0.1:8443".parse().unwrap(), None, false),
         }
     };
-    if let Some((cert, key)) = &tls {
-        axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
-            .await
-            .with_context(|| format!("loading TLS certificate {} / key {}", cert.display(), key.display()))?;
-    }
-    let creation = args.account_creation.as_str();
-    if !["auto", "manual", "disabled"].contains(&creation) {
-        bail!("--account-creation must be auto, manual or disabled");
-    }
-
-    // Files.
     let data_dir = args.data_dir.clone().unwrap_or_else(settings::default_data_dir);
-    std::fs::create_dir_all(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
-    let out = args.out.clone().unwrap_or_else(|| {
-        if is_root() {
-            PathBuf::from("/etc/beldex-lws/lws.toml")
-        } else {
-            data_dir.join("lws.toml")
-        }
-    });
-    if out.exists() && !args.force {
-        bail!("{} already exists; pass --force to replace it", out.display());
+    let plan = Plan {
+        network,
+        daemons,
+        database,
+        listen,
+        tls,
+        behind_proxy,
+        account_creation: args.account_creation.clone(),
+        out: args.out.clone().unwrap_or_else(|| default_config_path(&data_dir)),
+        data_dir,
+        force: args.force,
+    };
+    check_plan(&plan).await?;
+    let written = write_plan(&plan)?;
+
+    eprintln!();
+    eprintln!("Wrote {}", written.out.display());
+    for path in &written.created {
+        eprintln!("Created {}", path.display());
     }
+    eprintln!("  network   {}", plan.network.daemon_name());
+    eprintln!("  beldexd   {}", plan.daemons.join(", "));
+    eprintln!(
+        "  database  {}",
+        if plan.database.is_some() {
+            "PostgreSQL".to_owned()
+        } else {
+            format!("SQLite in {}", plan.data_dir.display())
+        }
+    );
+    eprintln!("  wallets   {}://{}", if plan.tls.is_some() { "https" } else { "http" }, plan.listen);
+    eprintln!("  admin     http://127.0.0.1:8444 (dashboard; token in {})", written.token.display());
+    if plan.behind_proxy {
+        eprintln!("\nPoint the proxy at {}. With Caddy, the whole Caddyfile is:\n", plan.listen);
+        eprintln!("    lws.example.com {{\n        reverse_proxy {}\n    }}\n", plan.listen);
+    }
+    eprintln!(
+        "\nBack up {} together with the database: without it, view keys cannot be read.",
+        written.seal_key.display()
+    );
+    let out = written.out.display();
+    eprintln!("\nNext:\n  beldex-lws doctor --config {out}\n  beldex-lws serve --config {out}");
+    Ok(())
+}
+
+/// Everything setup decides; the terminal and web front ends both build one.
+#[derive(Clone, Debug)]
+pub struct Plan {
+    pub network: Network,
+    pub daemons: Vec<String>,
+    /// PostgreSQL URL; None for SQLite in the data directory.
+    pub database: Option<String>,
+    pub listen: SocketAddr,
+    pub tls: Option<(PathBuf, PathBuf)>,
+    pub behind_proxy: bool,
+    pub account_creation: String,
+    pub data_dir: PathBuf,
+    pub out: PathBuf,
+    pub force: bool,
+}
+
+pub struct Written {
+    pub out: PathBuf,
+    pub created: Vec<PathBuf>,
+    pub seal_key: PathBuf,
+    pub token: PathBuf,
+    pub text: String,
+}
+
+/// /etc/beldex-lws/lws.toml as root, else lws.toml in the data directory.
+pub fn default_config_path(data_dir: &Path) -> PathBuf {
+    if is_root() {
+        PathBuf::from("/etc/beldex-lws/lws.toml")
+    } else {
+        data_dir.join("lws.toml")
+    }
+}
+
+pub async fn check_database(url: &str) -> Result<()> {
+    if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+        bail!("expected a postgres:// URL");
+    }
+    Store::probe(url, std::time::Duration::from_secs(8)).await.map_err(|e| match e {
+        lws_store::Error::Db(sqlx_error) if sqlx_error.to_string().contains("pool timed out") => {
+            anyhow::anyhow!("no answer within 8 seconds (host or firewall?)")
+        }
+        other => anyhow::anyhow!("{other}"),
+    })
+}
+
+pub async fn check_tls(cert: &Path, key: &Path) -> Result<()> {
+    axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+        .await
+        .with_context(|| format!("loading TLS certificate {} / key {}", cert.display(), key.display()))?;
+    Ok(())
+}
+
+/// Everything that can be checked before writing anything.
+pub async fn check_plan(plan: &Plan) -> Result<()> {
+    if plan.daemons.is_empty() {
+        bail!("at least one beldexd is needed");
+    }
+    if !["auto", "manual", "disabled"].contains(&plan.account_creation.as_str()) {
+        bail!("account creation must be auto, manual or disabled");
+    }
+    if let Some((cert, key)) = &plan.tls {
+        check_tls(cert, key).await?;
+    } else if !plan.listen.ip().is_loopback() {
+        bail!("wallets on a public address need TLS: give a certificate, or keep the API on loopback behind a proxy");
+    }
+    if plan.out.exists() && !plan.force {
+        bail!("{} already exists; replace it explicitly", plan.out.display());
+    }
+    Ok(())
+}
+
+/// Creates the data directory, keys (only if missing) and the config file.
+pub fn write_plan(plan: &Plan) -> Result<Written> {
+    let data_dir = &plan.data_dir;
+    std::fs::create_dir_all(data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
     let seal_key = data_dir.join(SEALING_KEY_FILE);
     let token = data_dir.join(ADMIN_TOKEN_FILE);
     let mut created = Vec::new();
@@ -239,9 +341,9 @@ pub async fn setup(args: SetupArgs) -> Result<()> {
         "# Keys are the long options of `beldex-lws serve --help`; LWS_* variables and flags override them.\n",
     );
     text.push_str("# Check it with: beldex-lws doctor --config <this file>\n\n");
-    text.push_str(&format!("network = {}\n", toml_str(&network.to_string())));
+    text.push_str(&format!("network = {}\n", toml_str(&plan.network.to_string())));
     text.push_str(&format!("data-dir = {}\n", toml_str(&data_dir.display().to_string())));
-    match &database {
+    match &plan.database {
         Some(url) => text.push_str(&format!(
             "database = {}\n# Every server sharing this database needs this same key: copy it, never regenerate it.\n",
             toml_str(url)
@@ -250,56 +352,37 @@ pub async fn setup(args: SetupArgs) -> Result<()> {
     }
     text.push_str(&format!("sealing-key-file = {}\n", toml_str(&seal_key.display().to_string())));
     text.push_str(&format!("admin-token-file = {}\n\n", toml_str(&token.display().to_string())));
-    let quoted: Vec<String> = daemons.iter().map(|d| toml_str(d)).collect();
+    let quoted: Vec<String> = plan.daemons.iter().map(|d| toml_str(d)).collect();
     text.push_str(&format!("daemon = [{}]\n", quoted.join(", ")));
-    match settings::detect_notify_socket(network) {
+    match settings::detect_notify_socket(plan.network) {
         Some(sock) => text.push_str(&format!("# New blocks are announced over {sock} (found automatically).\n")),
         None => text.push_str(
             "# notify = [\"ipc:///var/lib/beldex/beldexd.sock\"]   # beldexd's socket: new blocks are seen at once\n",
         ),
     }
     text.push('\n');
-    text.push_str(&format!("listen = {}\n", toml_str(&listen.to_string())));
-    if let Some((cert, key)) = &tls {
+    text.push_str(&format!("listen = {}\n", toml_str(&plan.listen.to_string())));
+    if let Some((cert, key)) = &plan.tls {
         text.push_str(&format!("tls-cert = {}\n", toml_str(&cert.display().to_string())));
         text.push_str(&format!("tls-key = {}\n", toml_str(&key.display().to_string())));
     }
-    if behind_proxy {
+    if plan.behind_proxy {
         text.push_str("trust-forwarded-for = true                  # the proxy on this machine sets X-Forwarded-For\n");
     }
-    text.push_str("admin-listen = \"127.0.0.1:8444\"\n");
-    text.push_str(&format!("account-creation = {}\n", toml_str(creation)));
+    text.push_str("admin-listen = \"127.0.0.1:8444\"             # dashboard and admin API\n");
+    text.push_str(&format!("account-creation = {}\n", toml_str(&plan.account_creation)));
     text.push_str("\n# Tuning (defaults shown):\n");
     text.push_str("# rate-limit = 20           # requests/second per client\n");
     text.push_str("# max-in-flight = 4096\n");
     text.push_str("# scan-threads = <all cores>\n");
+    text.push_str("# audit-retention-days = 365\n");
     text.push_str("# log-format = \"text\"       # or \"json\"\n");
 
-    if let Some(dir) = out.parent() {
+    if let Some(dir) = plan.out.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    write_config(&out, &text, args.force)?;
-
-    eprintln!();
-    eprintln!("Wrote {}", out.display());
-    for path in &created {
-        eprintln!("Created {}", path.display());
-    }
-    eprintln!("  network   {}", network.daemon_name());
-    eprintln!("  beldexd   {}", daemons.join(", "));
-    eprintln!(
-        "  database  {}",
-        if database.is_some() { "PostgreSQL".to_owned() } else { format!("SQLite in {}", data_dir.display()) }
-    );
-    eprintln!("  wallets   {}://{listen}", if tls.is_some() { "https" } else { "http" });
-    eprintln!("  admin     http://127.0.0.1:8444 (token in {})", token.display());
-    if behind_proxy {
-        eprintln!("\nPoint the proxy at 127.0.0.1:8443. With Caddy, the whole Caddyfile is:\n");
-        eprintln!("    lws.example.com {{\n        reverse_proxy 127.0.0.1:8443\n    }}\n");
-    }
-    eprintln!("\nBack up {} together with the database: without it, view keys cannot be read.", seal_key.display());
-    eprintln!("\nNext:\n  beldex-lws doctor --config {}\n  beldex-lws serve --config {}", out.display(), out.display());
-    Ok(())
+    write_config(&plan.out, &text, plan.force)?;
+    Ok(Written { out: plan.out.clone(), created, seal_key, token, text })
 }
 
 fn write_config(path: &Path, text: &str, replace: bool) -> Result<()> {

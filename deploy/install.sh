@@ -3,6 +3,7 @@
 #
 #   sudo ./install.sh                       # install, configure (asks on a terminal), start
 #   sudo ./install.sh --yes --network test  # no questions; any `beldex-lws setup` option works
+#   sudo ./install.sh --web                 # answer the setup questions in a browser
 #   sudo ./install.sh --import-lmdb /var/lib/beldex-lws-old   # bring the LMDB server's accounts
 #   sudo ./install.sh --upgrade             # new binaries, same config, restart
 #   sudo ./install.sh --uninstall           # remove the service and binaries, keep data
@@ -23,7 +24,7 @@ import_lmdb=
 destdir=
 setup_args=()
 
-usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit "${1:-0}"; }
 say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
@@ -130,12 +131,18 @@ if [ -f "$CONFIG_DIR/lws.toml" ]; then
 else
     say "configuring"
     # As the service user, so keys belong to it and the beldexd socket check
-    # sees what the service will see.
-    tmp=$DATA_DIR/.lws.toml.setup
-    rm -f "$tmp"
-    as_service "$PREFIX/bin/beldex-lws" setup --data-dir "$DATA_DIR" --out "$tmp" ${setup_args[@]+"${setup_args[@]}"}
-    install -m 0640 -o root -g "$SERVICE_USER" "$tmp" "$CONFIG_DIR/lws.toml"
-    rm -f "$tmp"
+    # sees what the service will see; the config directory is writable for it
+    # only while setup runs. With --web, setup runs in a browser.
+    chmod 0770 "$CONFIG_DIR"
+    if ! as_service "$PREFIX/bin/beldex-lws" setup --data-dir "$DATA_DIR" --out "$CONFIG_DIR/lws.toml" \
+        ${setup_args[@]+"${setup_args[@]}"}; then
+        chmod 0750 "$CONFIG_DIR"
+        die "setup did not finish; run the installer again"
+    fi
+    chmod 0750 "$CONFIG_DIR"
+    [ -f "$CONFIG_DIR/lws.toml" ] || die "setup wrote no configuration"
+    chown root:"$SERVICE_USER" "$CONFIG_DIR/lws.toml"
+    chmod 0640 "$CONFIG_DIR/lws.toml"
 fi
 
 if [ -n "$import_lmdb" ]; then
@@ -169,6 +176,8 @@ as_service "$PREFIX/bin/beldex-lws" doctor --config "$CONFIG_DIR/lws.toml" || tr
 cat <<EOF
 
 beldex-lws is running.
+  dashboard  http://127.0.0.1:8444/ (token: sudo cat $DATA_DIR/beldex-lws-admin.token)
+             from elsewhere: ssh -L 8444:127.0.0.1:8444 <this server>, then open the same address
   config     $CONFIG_DIR/lws.toml
   data       $DATA_DIR (back up the database together with beldex-lws-seal.key)
   logs       journalctl -u beldex-lws -f

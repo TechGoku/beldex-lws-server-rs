@@ -228,6 +228,11 @@ pub struct ServeArgs {
     /// Defaults to 127.0.0.1:8444, unless the wallet API uses port 8444.
     #[arg(long, env = "LWS_ADMIN_LISTEN")]
     pub admin_listen: Option<SocketAddr>,
+    /// Let the admin API bind every interface (0.0.0.0). Only inside a
+    /// container whose port is published on loopback, or on a private
+    /// network; the bearer token is still required.
+    #[arg(long, env = "LWS_ADMIN_ANY_INTERFACE", value_parser = BoolishValueParser::new())]
+    pub admin_any_interface: bool,
     /// File holding the bearer token for admin routes. Default:
     /// beldex-lws-admin.token in the data directory, created on first start.
     #[arg(long, env = "LWS_ADMIN_TOKEN_FILE")]
@@ -302,6 +307,9 @@ pub struct ServeArgs {
     /// Download full transactions instead of pruned ones.
     #[arg(long, env = "LWS_NO_PRUNE", value_parser = BoolishValueParser::new())]
     pub no_prune: bool,
+    /// Days of audit log kept (0 keeps everything).
+    #[arg(long, env = "LWS_AUDIT_RETENTION_DAYS", default_value_t = 365)]
+    pub audit_retention_days: u64,
     /// Name this process uses for scanner leases (default: host and pid).
     #[arg(long, env = "LWS_INSTANCE")]
     pub instance: Option<String>,
@@ -455,8 +463,11 @@ impl ServeArgs {
             if !admin.ip().is_loopback() && !admin.ip().is_unspecified() {
                 tracing::warn!(addr = %admin, "admin API is not on loopback; make sure only operators can reach it");
             }
-            if admin.ip().is_unspecified() {
-                bail!("refusing to bind the admin API to every interface ({admin}); pick a private address");
+            if admin.ip().is_unspecified() && !self.admin_any_interface {
+                bail!(
+                    "refusing to bind the admin API to every interface ({admin}); pick a private address \
+                     (or pass --admin-any-interface inside a container)"
+                );
             }
             if self.role != Role::Scanner && self.listen.port() == admin.port() {
                 bail!("--listen and --admin-listen must use different ports");

@@ -129,6 +129,7 @@ enum Fetched {
 /// below the height asked for is dropped.
 struct Prefetcher {
     daemon: Arc<Daemon>,
+    metrics: Arc<Metrics>,
     prune: bool,
     lane: usize,
     window: usize,
@@ -146,7 +147,7 @@ impl Prefetcher {
         let lane = self.lane + self.issued;
         self.issued += 1;
         self.budget = self.budget.saturating_sub(1);
-        tokio::spawn(Scanner::fetch(self.daemon.clone(), request, lane))
+        tokio::spawn(Scanner::fetch(self.daemon.clone(), self.metrics.clone(), request, lane))
     }
 
     fn fill(&mut self) {
@@ -394,8 +395,16 @@ impl Scanner {
         }
     }
 
-    async fn fetch(daemon: Arc<Daemon>, request: GetBlocks, lane: usize) -> anyhow::Result<Fetched> {
-        match daemon.get_blocks(&request, lane).await {
+    async fn fetch(
+        daemon: Arc<Daemon>,
+        metrics: Arc<Metrics>,
+        request: GetBlocks,
+        lane: usize,
+    ) -> anyhow::Result<Fetched> {
+        let began = Instant::now();
+        let result = daemon.get_blocks(&request, lane).await;
+        metrics.daemon_fetch_duration_seconds.observe(began.elapsed());
+        match result {
             Ok(blocks) => Ok(Fetched::Blocks(blocks)),
             // An explicit start beyond the daemon's tip is refused with a
             // failed status; it only means there is nothing new yet.
@@ -419,7 +428,8 @@ impl Scanner {
             GetBlocks { start_height: start, prune: self.config.prune, ..Default::default() }
         };
 
-        let mut first_fetch = Some(tokio::spawn(Self::fetch(self.daemon.clone(), request, lane_no)));
+        let mut first_fetch =
+            Some(tokio::spawn(Self::fetch(self.daemon.clone(), self.metrics.clone(), request, lane_no)));
         let mut ahead: Option<Prefetcher> = None;
         let mut parent: Option<BlockId> = by_ids.then(|| sample[0]);
         let mut first = true;
@@ -468,6 +478,7 @@ impl Scanner {
             if ahead.is_none() {
                 let mut pre = Prefetcher {
                     daemon: self.daemon.clone(),
+                    metrics: self.metrics.clone(),
                     prune: self.config.prune,
                     lane: lane_no,
                     window: self.config.fetch_window.max(1),
@@ -491,7 +502,8 @@ impl Scanner {
                 })
                 .collect();
             let ids: Vec<AccountId> = accounts.iter().map(|a| a.id).collect();
-            let began = Instant::now();
+            let batch_began = Instant::now();
+            let began = batch_began;
             let scanned = {
                 let pool = self.pool.clone();
                 let per_task = self.config.accounts_per_task.max(1);
@@ -520,6 +532,7 @@ impl Scanner {
             let began = Instant::now();
             let committed = self.store.commit_scan(&commit).await;
             debug!(build_ms, commit_ms = began.elapsed().as_millis() as u64, "batch db");
+            self.metrics.scan_batch_duration_seconds.observe(batch_began.elapsed());
             match committed {
                 Ok(report) => {
                     Metrics::add(&self.metrics.blocks_scanned_total, commit.blocks.len() as u64);

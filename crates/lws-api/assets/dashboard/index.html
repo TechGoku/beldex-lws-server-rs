@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Beldex LWS Admin</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b6bcb'/%3E%3Ctext x='16' y='22' font-size='16' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='700'%3EB%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/ui/ui.css?v={{VERSION}}">
+<script src="/ui/app.js?v={{VERSION}}" defer></script>
+</head>
+<body>
+
+<section id="signin" class="center" hidden>
+  <form class="card panel stack" id="signin-form">
+    <div class="brand"><span class="logo">B</span><h1>Beldex LWS administration</h1></div>
+    <p class="muted">Sign in with the admin token. It is in <code>beldex-lws-admin.token</code> in the server's data directory (or the file given to <code>--admin-token-file</code>).</p>
+    <div class="field">
+      <label for="token">Admin token</label>
+      <input id="token" type="password" autocomplete="off" spellcheck="false" required>
+    </div>
+    <div class="row"><input id="remember" type="checkbox"><label for="remember">Stay signed in for this tab</label></div>
+    <p id="signin-error" class="small error-text" role="alert"></p>
+    <div class="row"><button class="btn primary" type="submit">Sign in</button></div>
+  </form>
+</section>
+
+<div id="app" hidden>
+  <div class="chrome">
+  <header class="topbar">
+    <div class="brand"><span class="logo">B</span><span>Beldex LWS</span></div>
+    <span id="status-pill" class="pill">…</span>
+    <span id="network" class="tag"></span>
+    <span class="spacer"></span>
+    <span id="refreshed" class="meta"></span>
+    <span class="row meta"><input id="auto" type="checkbox" checked><label for="auto">Live</label></span>
+    <button class="btn" id="theme" type="button" title="Switch theme">Theme</button>
+    <button class="btn" id="signout" type="button">Sign out</button>
+  </header>
+  <nav class="tabs" role="tablist" aria-label="Sections">
+    <button role="tab" data-tab="overview" aria-selected="true">Overview</button>
+    <button role="tab" data-tab="accounts">Accounts</button>
+    <button role="tab" data-tab="requests">Requests<span class="count" id="requests-count" hidden></span></button>
+    <button role="tab" data-tab="cluster">Cluster</button>
+    <button role="tab" data-tab="audit">Audit log</button>
+    <button role="tab" data-tab="settings">Settings</button>
+  </nav>
+  </div>
+  <main>
+    <section data-view="overview" class="stack">
+      <div class="grid" id="kpis"></div>
+      <div class="grid wide">
+        <div class="card"><h2>Wallet API requests per second</h2><div id="chart-rps"></div></div>
+        <div class="card"><h2>Wallet API latency (ms, this window)</h2><div id="chart-latency"></div></div>
+        <div class="card"><h2>Blocks scanned per second</h2><div id="chart-blocks"></div></div>
+        <div class="card"><h2>Scanner lag (blocks behind the chain)</h2><div id="chart-lag"></div></div>
+      </div>
+      <div class="card"><h2>beldexd</h2><div id="daemons"></div></div>
+      <div class="grid wide">
+        <div class="card"><h2>Scanning</h2><div id="scanning"></div></div>
+        <div class="card"><h2>Database</h2><div id="database"></div></div>
+      </div>
+    </section>
+
+    <section data-view="accounts" class="stack" hidden>
+      <form class="row" id="account-filter">
+        <input id="account-q" class="search" type="search" placeholder="Address or prefix" spellcheck="false">
+        <select id="account-status" aria-label="Status">
+          <option value="all">All statuses</option>
+          <option value="active">Active</option>
+          <option value="inactive">Inactive</option>
+          <option value="hidden">Hidden</option>
+        </select>
+        <span class="row"><input id="account-behind" type="checkbox"><label for="account-behind">Behind only</label></span>
+        <button class="btn" type="submit">Search</button>
+        <span class="grow"></span>
+        <button class="btn primary" type="button" id="add-account">Add account</button>
+      </form>
+      <div class="row" id="bulk" hidden>
+        <span id="bulk-count" class="muted"></span>
+        <button class="btn" type="button" data-bulk="active">Set active</button>
+        <button class="btn" type="button" data-bulk="inactive">Set inactive</button>
+        <button class="btn" type="button" data-bulk="hidden">Hide</button>
+        <button class="btn" type="button" data-bulk="rescan">Rescan…</button>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr>
+          <th><input type="checkbox" id="select-all" aria-label="Select all"></th>
+          <th>Address</th><th>Status</th><th class="num">Scanned to</th><th class="num">Behind</th>
+          <th class="num">Start</th><th>Created</th><th>Last seen</th><th></th>
+        </tr></thead>
+        <tbody id="accounts"></tbody>
+      </table></div>
+      <div class="row"><button class="btn" type="button" id="accounts-more" hidden>Load more</button></div>
+    </section>
+
+    <section data-view="requests" class="stack" hidden>
+      <p class="muted">Account creations wait here when account creation is <code>manual</code>; full-history rescans (imports) wait here unless <code>--auto-accept-imports</code> is set.</p>
+      <div class="row">
+        <button class="btn primary" type="button" id="accept">Accept selected</button>
+        <button class="btn danger" type="button" id="reject">Reject selected</button>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr><th><input type="checkbox" id="select-all-requests" aria-label="Select all"></th><th>Type</th><th>Address</th><th class="num">Start height</th><th>Requested</th></tr></thead>
+        <tbody id="requests"></tbody>
+      </table></div>
+    </section>
+
+    <section data-view="cluster" class="stack" hidden>
+      <p class="muted">Every process of this deployment reports in every 10 seconds. Ones silent for a minute are marked stale.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Instance</th><th>Role</th><th>Version</th><th>Up</th><th>Last report</th><th class="num">Requests</th><th class="num">p95</th><th class="num">Blocks scanned</th><th class="num">Accounts</th><th class="num">Lag</th></tr></thead>
+        <tbody id="instances"></tbody>
+      </table></div>
+      <div class="card"><h2>Scanner shards</h2><div id="leases"></div></div>
+    </section>
+
+    <section data-view="audit" class="stack" hidden>
+      <p class="muted">Every change made through the admin API, the dashboard or <code>beldex-lws admin</code>.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Time</th><th>Who</th><th>From</th><th>Action</th><th>Detail</th></tr></thead>
+        <tbody id="audit"></tbody>
+      </table></div>
+      <div class="row"><button class="btn" type="button" id="audit-more" hidden>Load more</button></div>
+    </section>
+
+    <section data-view="settings" class="stack" hidden>
+      <div class="grid wide">
+        <div class="card"><h2>This server</h2><div id="server-info"></div></div>
+        <div class="card"><h2>Wallet API</h2><div id="api-config"></div></div>
+      </div>
+      <div class="card">
+        <h2>Monitoring</h2>
+        <p class="muted">Prometheus metrics are at <code>/metrics</code> on this listener; <code>/ready</code> and <code>/health</code> serve load balancers. A Grafana dashboard and alert rules ship in <code>deploy/monitoring/</code>.</p>
+      </div>
+    </section>
+  </main>
+</div>
+
+<dialog id="confirm">
+  <form method="dialog">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-text" class="muted"></p>
+    <div id="confirm-extra"></div>
+    <div class="actions"><button class="btn" value="cancel">Cancel</button><button class="btn primary" value="ok" id="confirm-ok">Confirm</button></div>
+  </form>
+</dialog>
+
+<dialog id="account-dialog">
+  <form method="dialog" id="account-form" class="stack">
+    <h2>Add an account</h2>
+    <div class="field"><label for="new-address">Address</label><input id="new-address" required spellcheck="false" autocomplete="off"></div>
+    <div class="field"><label for="new-key">Secret view key</label><input id="new-key" type="password" required spellcheck="false" autocomplete="off"><span class="hint">64 hex characters. Stored encrypted; never shown again.</span></div>
+    <div class="field"><label for="new-height">Scan from height</label><input id="new-height" type="number" min="0" placeholder="Chain tip"><span class="hint">Leave empty to start at the chain tip. 0 scans the whole chain.</span></div>
+    <div class="row"><input id="new-admin" type="checkbox"><label for="new-admin">Admin account (can authorise LMDB-style admin calls)</label></div>
+    <p id="account-error" class="small error-text" role="alert"></p>
+    <div class="actions"><button class="btn" value="cancel" formnovalidate>Cancel</button><button class="btn primary" value="ok">Add</button></div>
+  </form>
+</dialog>
+
+<dialog id="detail-dialog">
+  <form method="dialog" class="stack">
+    <h2>Account</h2>
+    <div id="detail"></div>
+    <div class="actions"><button class="btn" value="close">Close</button></div>
+  </form>
+</dialog>
+
+<div id="toasts" aria-live="polite"></div>
+</body>
+</html>

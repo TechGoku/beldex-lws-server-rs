@@ -1,0 +1,74 @@
+# Alert rules for beldex-lws. Load with rule_files in prometheus.yml.
+groups:
+  - name: beldex-lws
+    rules:
+      - alert: BeldexLwsDown
+        expr: up{job="beldex-lws"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "beldex-lws {{ $labels.instance }} is not answering"
+          description: "Prometheus has not scraped {{ $labels.instance }} for 2 minutes. Check `systemctl status beldex-lws` and `beldex-lws doctor`."
+
+      - alert: BeldexLwsScannerBehind
+        expr: (beldex_lws_daemon_height - beldex_lws_min_scan_height - 1) > 20 and beldex_lws_scanned_accounts > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Scanner {{ $labels.instance }} is {{ $value }} blocks behind"
+          description: "Wallets see stale balances. Look at scan errors, beldexd health and CPU; add scanner shards if it keeps growing."
+
+      - alert: BeldexLwsScannerStalled
+        expr: increase(beldex_lws_scan_passes_total[10m]) == 0 and beldex_lws_scanned_accounts > 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "Scanner {{ $labels.instance }} has not run for 10 minutes"
+
+      - alert: BeldexLwsScanErrors
+        expr: rate(beldex_lws_scan_errors_total[10m]) > 0.05
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Scanner {{ $labels.instance }} keeps failing batches"
+          description: "See the server log for 'lane failed'. Usually beldexd is unreachable or out of sync."
+
+      - alert: BeldexLwsServerErrors
+        expr: |
+          rate(beldex_lws_http_server_errors_total[5m])
+            / clamp_min(rate(beldex_lws_http_requests_total[5m]), 1e-9) > 0.02
+          and rate(beldex_lws_http_requests_total[5m]) > 1
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.instance }} answers {{ $value | humanizePercentage }} of wallet requests with 5xx"
+
+      - alert: BeldexLwsLatencyHigh
+        expr: |
+          histogram_quantile(0.95, sum by (instance, le) (rate(beldex_lws_http_request_duration_seconds_bucket[5m]))) > 1
+          and sum by (instance) (rate(beldex_lws_http_requests_total[5m])) > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Wallet API p95 latency on {{ $labels.instance }} is {{ $value | humanizeDuration }}"
+
+      - alert: BeldexLwsShedding
+        expr: rate(beldex_lws_http_shed_total[5m]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }} is refusing requests at --max-in-flight"
+          description: "Add API replicas, or raise --max-in-flight if CPU and the database have headroom."
+
+      - alert: BeldexLwsNotificationsDown
+        expr: beldex_lws_block_notifications_connected == 0 and beldex_lws_scanned_accounts > 0 and beldex_lws_block_notifications_total > 0
+        for: 15m
+        labels: { severity: info }
+        annotations:
+          summary: "{{ $labels.instance }} lost beldexd's block notifications; new blocks wait for the next poll"
+
+      - alert: BeldexLwsRestarted
+        expr: changes(beldex_lws_process_start_time_seconds[30m]) > 2
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }} restarted {{ $value }} times in 30 minutes"

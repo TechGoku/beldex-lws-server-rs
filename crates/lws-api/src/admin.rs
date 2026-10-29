@@ -11,11 +11,16 @@
 //!
 //! Both are compared in constant time and never logged. A missing or wrong
 //! bearer token is 401; a wrong `auth` key is 403, as before.
+//!
+//! Every change, through these routes or the JSON API under `/api/v1` (see
+//! [`crate::admin_v1`]), is recorded in the audit log with who made it and
+//! from where. The dashboard is served at `/`.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -27,30 +32,58 @@ use lws_store::{CreateOutcome, NewAccount};
 use serde::Deserialize;
 use serde_json::{json, Value as Json};
 use subtle::ConstantTimeEq;
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::admin_v1;
 use crate::error::{ApiError, ApiResult};
 use crate::wire::hex32;
-use crate::{json_bytes, json_response, AppState};
+use crate::{json_bytes, json_response, ui, AppState};
 
 pub struct AdminState {
     pub app: Arc<AppState>,
     /// Bearer token; `None` disables bearer authorisation.
     pub token: Option<Vec<u8>>,
+    /// About this process (version, role, instance, listeners), for the
+    /// dashboard. No secrets.
+    pub info: Json,
+}
+
+/// Who made an authorised admin request, for the audit log.
+#[derive(Clone, Debug)]
+pub struct Who {
+    /// `token`, or `admin-account <address prefix>`.
+    pub actor: String,
+    pub remote: String,
+}
+
+/// Records an administrative change: audit log, metrics and the log
+/// (target `audit`). A failure to record is logged, not returned: the change
+/// has already been made.
+pub async fn audit(state: &AdminState, who: &Who, action: &str, detail: Json) {
+    lws_core::metrics::Metrics::add(&state.app.metrics.admin_actions_total, 1);
+    let detail = detail.to_string();
+    info!(target: "audit", actor = %who.actor, remote = %who.remote, action, %detail, "admin action");
+    if let Err(e) = state.app.primary.record_audit(&who.actor, &who.remote, action, &detail).await {
+        warn!(error = %e, action, "could not write the audit log");
+    }
 }
 
 const MAX_ADMIN_BODY: usize = 1024 * 1024;
 
-/// Whether `key` is the view key of an active or hidden admin account.
-async fn admin_key_ok(state: &AdminState, key: &str) -> bool {
-    let Some(key) = hex32(key) else { return false };
-    let Ok(view_public) = lws_kernel::secret_to_public(&key) else { return false };
-    let Ok(admins) = state.app.primary.admin_accounts().await else { return false };
-    admins.iter().any(|a| {
-        a.status != AccountStatus::Inactive
-            && a.view_public == view_public
-            && bool::from(a.view_key.bytes().ct_eq(&key))
-    })
+/// The address of the active or hidden admin account `key` is the view
+/// key of, if any.
+async fn admin_key_ok(state: &AdminState, key: &str) -> Option<String> {
+    let key = hex32(key)?;
+    let view_public = lws_kernel::secret_to_public(&key).ok()?;
+    let admins = state.app.primary.admin_accounts().await.ok()?;
+    admins
+        .into_iter()
+        .find(|a| {
+            a.status != AccountStatus::Inactive
+                && a.view_public == view_public
+                && bool::from(a.view_key.bytes().ct_eq(&key))
+        })
+        .map(|a| a.address)
 }
 
 async fn authorize(State(state): State<Arc<AdminState>>, req: Request, next: Next) -> Response {
@@ -64,24 +97,37 @@ async fn authorize(State(state): State<Arc<AdminState>>, req: Request, next: Nex
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::as_bytes);
-    let allowed = match (&state.token, bearer) {
-        (Some(expected), Some(given)) => expected.len() == given.len() && bool::from(expected.as_slice().ct_eq(given)),
-        (_, Some(_)) => false,
+    let actor = match (&state.token, bearer) {
+        (Some(expected), Some(given))
+            if expected.len() == given.len() && bool::from(expected.as_slice().ct_eq(given)) =>
+        {
+            Some("token".to_owned())
+        }
+        (_, Some(_)) => None,
         (_, None) => {
             let auth = serde_json::from_slice::<Json>(&bytes)
                 .ok()
                 .and_then(|v| v.get("auth").and_then(Json::as_str).map(str::to_owned));
             match auth {
-                Some(key) if admin_key_ok(&state, &key).await => true,
-                Some(_) => return (StatusCode::FORBIDDEN, "Forbidden").into_response(),
-                None => false,
+                Some(key) => match admin_key_ok(&state, &key).await {
+                    Some(address) => Some(format!("admin-account {}", address.get(..12).unwrap_or(&address))),
+                    None => return (StatusCode::FORBIDDEN, "Forbidden").into_response(),
+                },
+                None => None,
             }
         }
     };
-    if !allowed {
+    let Some(actor) = actor else {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
-    }
-    next.run(Request::from_parts(parts, Body::from(bytes))).await
+    };
+    let remote = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let mut req = Request::from_parts(parts, Body::from(bytes));
+    req.extensions_mut().insert(Who { actor, remote });
+    next.run(req).await
 }
 
 fn params<T: for<'de> Deserialize<'de>>(body: &Bytes) -> ApiResult<T> {
@@ -147,7 +193,11 @@ struct AddAccount {
     admin: bool,
 }
 
-async fn add_account(State(s): State<Arc<AdminState>>, body: Bytes) -> ApiResult<Response> {
+async fn add_account(
+    State(s): State<Arc<AdminState>>,
+    axum::Extension(who): axum::Extension<Who>,
+    body: Bytes,
+) -> ApiResult<Response> {
     let p: AddAccount = params(&body)?;
     let network = s.app.config.network;
     let (view_public, spend_public) =
@@ -170,7 +220,10 @@ async fn add_account(State(s): State<Arc<AdminState>>, body: Bytes) -> ApiResult
         start_height,
     };
     let created = matches!(s.app.primary.create_account(&new).await?, CreateOutcome::Created(_));
-    info!(address = %new.address, created, start_height, "admin add_account");
+    if created {
+        audit(&s, &who, "add_account", json!({"address": new.address, "start_height": start_height, "admin": p.admin}))
+            .await;
+    }
     let updated: Vec<&str> = if created { vec![new.address.as_str()] } else { vec![] };
     Ok(json_response(json_bytes(&s.app, &json!({"updated": updated}))?))
 }
@@ -182,16 +235,25 @@ struct Requests {
     addresses: Vec<String>,
 }
 
-async fn accept_requests(State(s): State<Arc<AdminState>>, body: Bytes) -> ApiResult<Response> {
+async fn accept_requests(
+    State(s): State<Arc<AdminState>>,
+    axum::Extension(who): axum::Extension<Who>,
+    body: Bytes,
+) -> ApiResult<Response> {
     let p: Requests = params(&body)?;
     let accepted = s.app.primary.accept_requests(kind_of(&p.kind)?, &p.addresses).await?;
-    info!(count = accepted.len(), kind = %p.kind, "admin accepted requests");
+    audit(&s, &who, "accept_requests", json!({"kind": p.kind, "updated": accepted.len()})).await;
     Ok(json_response(json_bytes(&s.app, &json!({"updated": accepted}))?))
 }
 
-async fn reject_requests(State(s): State<Arc<AdminState>>, body: Bytes) -> ApiResult<Response> {
+async fn reject_requests(
+    State(s): State<Arc<AdminState>>,
+    axum::Extension(who): axum::Extension<Who>,
+    body: Bytes,
+) -> ApiResult<Response> {
     let p: Requests = params(&body)?;
     let removed = s.app.primary.reject_requests(kind_of(&p.kind)?, &p.addresses).await?;
+    audit(&s, &who, "reject_requests", json!({"kind": p.kind, "updated": removed.len()})).await;
     Ok(json_response(json_bytes(&s.app, &json!({"updated": removed}))?))
 }
 
@@ -201,11 +263,15 @@ struct ModifyStatus {
     addresses: Vec<String>,
 }
 
-async fn modify_account_status(State(s): State<Arc<AdminState>>, body: Bytes) -> ApiResult<Response> {
+async fn modify_account_status(
+    State(s): State<Arc<AdminState>>,
+    axum::Extension(who): axum::Extension<Who>,
+    body: Bytes,
+) -> ApiResult<Response> {
     let p: ModifyStatus = params(&body)?;
     let status: AccountStatus = p.status.parse().map_err(ApiError::BadRequest)?;
     let updated = s.app.primary.set_status(&p.addresses, status).await?;
-    info!(updated = updated.len(), status = %p.status, "admin modified account status");
+    audit(&s, &who, "set_status", json!({"status": p.status, "updated": updated.len()})).await;
     Ok(json_response(json_bytes(&s.app, &json!({"updated": updated}))?))
 }
 
@@ -215,10 +281,14 @@ struct Rescan {
     addresses: Vec<String>,
 }
 
-async fn rescan(State(s): State<Arc<AdminState>>, body: Bytes) -> ApiResult<Response> {
+async fn rescan(
+    State(s): State<Arc<AdminState>>,
+    axum::Extension(who): axum::Extension<Who>,
+    body: Bytes,
+) -> ApiResult<Response> {
     let p: Rescan = params(&body)?;
     let updated = s.app.primary.rescan(&p.addresses, p.height).await?;
-    info!(updated = updated.len(), height = p.height, "admin rescan");
+    audit(&s, &who, "rescan", json!({"height": p.height, "updated": updated.len()})).await;
     Ok(json_response(json_bytes(&s.app, &json!({"updated": updated}))?))
 }
 
@@ -299,6 +369,59 @@ async fn ready(State(s): State<Arc<AdminState>>) -> StatusCode {
     }
 }
 
+/// The operations listener of a scanner-only process: metrics and probes,
+/// nothing that needs the API's state.
+pub fn ops_router(
+    metrics: Arc<lws_core::metrics::Metrics>,
+    store: Arc<lws_store::Store>,
+    daemon: Arc<lws_daemon::Daemon>,
+) -> Router {
+    let m = metrics.clone();
+    let (s, d) = (store.clone(), daemon.clone());
+    Router::new()
+        .route(
+            "/metrics",
+            get(move || {
+                let m = m.clone();
+                async move { ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], m.render()).into_response() }
+            }),
+        )
+        .route(
+            "/ready",
+            get(move || {
+                let (s, d) = (s.clone(), d.clone());
+                async move {
+                    if s.ping().await.is_ok() && d.status().iter().any(|e| e.healthy) {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        )
+        .route(
+            "/health",
+            get(move || {
+                let (s, d, m) = (store.clone(), daemon.clone(), metrics.clone());
+                async move {
+                    let db = s.ping().await.is_ok();
+                    let body = json!({
+                        "status": if db { "ok" } else { "degraded" },
+                        "role": "scanner",
+                        "database": {"backend": s.backend(), "primary": db},
+                        "daemon": {"height": lws_core::metrics::Metrics::get(&m.daemon_height), "endpoints": d.status()},
+                        "scanner": {"min_scan_height": lws_core::metrics::Metrics::get(&m.min_scan_height),
+                                    "accounts": lws_core::metrics::Metrics::get(&m.scanned_accounts)},
+                        "time": now_secs(),
+                    });
+                    let code = if db { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+                    (code, [(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+                }
+            }),
+        )
+        .layer(middleware::from_fn(ui::admin_headers))
+}
+
 pub fn admin_router(state: Arc<AdminState>) -> Router {
     let protected = Router::new()
         .route("/list_accounts", post(list_accounts))
@@ -310,6 +433,16 @@ pub fn admin_router(state: Arc<AdminState>) -> Router {
         .route("/rescan", post(rescan))
         .route("/validate", post(validate))
         .route("/switch_db", post(switch_db))
+        .route("/api/v1/overview", get(admin_v1::overview))
+        .route("/api/v1/accounts", get(admin_v1::accounts).post(admin_v1::add_account))
+        .route("/api/v1/accounts/status", post(admin_v1::set_status))
+        .route("/api/v1/accounts/rescan", post(admin_v1::rescan))
+        .route("/api/v1/accounts/{address}", get(admin_v1::account))
+        .route("/api/v1/requests", get(admin_v1::requests))
+        .route("/api/v1/requests/accept", post(admin_v1::accept))
+        .route("/api/v1/requests/reject", post(admin_v1::reject))
+        .route("/api/v1/audit", get(admin_v1::audit_log))
+        .route("/api/v1/config", get(admin_v1::config))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize))
         .layer(DefaultBodyLimit::max(1024 * 1024));
     Router::new()
@@ -317,5 +450,7 @@ pub fn admin_router(state: Arc<AdminState>) -> Router {
         .route("/ready", get(ready))
         .route("/metrics", get(metrics))
         .merge(protected)
+        .merge(ui::dashboard_routes())
+        .layer(middleware::from_fn(ui::admin_headers))
         .with_state(state)
 }

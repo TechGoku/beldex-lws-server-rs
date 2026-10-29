@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Beldex LWS Setup</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b6bcb'/%3E%3Ctext x='16' y='22' font-size='16' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='700'%3EB%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/ui/ui.css?v={{VERSION}}">
+<script src="/ui/setup.js?v={{VERSION}}" defer></script>
+</head>
+<body>
+<div class="center">
+  <div class="card panel stack" id="wizard">
+    <div class="brand"><span class="logo">B</span><h1>Set up the Beldex light wallet server</h1></div>
+    <div class="steps" id="steps"><span></span><span></span><span></span><span></span><span></span></div>
+    <p id="fatal" class="error-text" role="alert" hidden></p>
+
+    <section data-step="0" class="stack">
+      <h2>1. beldexd</h2>
+      <p class="muted small">The server reads the chain from beldexd over RPC. Pick the one found on this machine, or enter another. Several make it faster and keep it running when one fails.</p>
+      <div id="found" class="stack"></div>
+      <div class="field">
+        <label for="daemons">beldexd RPC addresses, one per line</label>
+        <textarea id="daemons" rows="3" spellcheck="false"></textarea>
+        <span class="hint">e.g. http://127.0.0.1:19091 (mainnet), :29091 (testnet), :39091 (devnet)</span>
+      </div>
+      <div class="row"><button class="btn" type="button" id="test-daemons">Test</button><span id="daemon-result" class="small"></span></div>
+      <div class="field">
+        <label for="network">Network</label>
+        <select id="network"><option value="mainnet">mainnet</option><option value="testnet">testnet</option><option value="devnet">devnet</option></select>
+        <span class="hint">Taken from the daemon when it answers.</span>
+      </div>
+    </section>
+
+    <section data-step="1" class="stack" hidden>
+      <h2>2. Database</h2>
+      <label class="choice"><input type="radio" name="db" value="sqlite" checked><span><strong>SQLite</strong><span class="muted small">One machine. Nothing to install; the database lives in the data directory.</span></span></label>
+      <label class="choice"><input type="radio" name="db" value="postgres"><span><strong>PostgreSQL</strong><span class="muted small">Several API servers and scanners sharing one database, replicas, large deployments.</span></span></label>
+      <div class="field" id="pg-field" hidden>
+        <label for="pg-url">PostgreSQL URL</label>
+        <input id="pg-url" type="password" placeholder="postgres://user:password@host/beldex_lws" spellcheck="false" autocomplete="off">
+        <span class="hint">The database must exist. It is written to the config file, readable only by the server's user.</span>
+        <div class="row"><button class="btn" type="button" id="test-db">Test connection</button><span id="db-result" class="small"></span></div>
+      </div>
+    </section>
+
+    <section data-step="2" class="stack" hidden>
+      <h2>3. How wallets reach the server</h2>
+      <label class="choice"><input type="radio" name="access" value="local" checked><span><strong>Only this machine</strong><span class="muted small">Wallets on this machine, or over a VPN or SSH tunnel.</span></span></label>
+      <label class="choice"><input type="radio" name="access" value="proxy"><span><strong>The internet, through a TLS proxy here</strong><span class="muted small">Caddy or nginx terminates HTTPS and forwards to the server. Recommended for public servers.</span></span></label>
+      <label class="choice"><input type="radio" name="access" value="tls"><span><strong>The internet, with HTTPS served directly</strong><span class="muted small">You have a certificate and key in PEM files.</span></span></label>
+      <div id="tls-fields" class="stack" hidden>
+        <div class="field"><label for="tls-cert">Certificate chain (PEM)</label><input id="tls-cert" value="/etc/beldex-lws/tls/fullchain.pem" spellcheck="false"></div>
+        <div class="field"><label for="tls-key">Private key (PEM)</label><input id="tls-key" value="/etc/beldex-lws/tls/privkey.pem" spellcheck="false"></div>
+        <div class="row"><button class="btn" type="button" id="test-tls">Check files</button><span id="tls-result" class="small"></span></div>
+      </div>
+      <div id="proxy-fields" class="stack" hidden>
+        <div class="field"><label for="domain">Public name (for the proxy example)</label><input id="domain" placeholder="lws.example.com" spellcheck="false"></div>
+        <pre class="box" id="caddyfile"></pre>
+      </div>
+      <div class="field"><label for="port">Wallet API port</label><input id="port" type="number" min="1" max="65535" value="8443"></div>
+    </section>
+
+    <section data-step="3" class="stack" hidden>
+      <h2>4. Accounts and files</h2>
+      <div class="field">
+        <label for="creation">New wallets</label>
+        <select id="creation">
+          <option value="auto">Register themselves on first login</option>
+          <option value="manual">Wait for an administrator's approval</option>
+          <option value="disabled">Are refused; only administrators add accounts</option>
+        </select>
+      </div>
+      <div class="field"><label for="data-dir">Data directory (database, sealing key, admin token)</label><input id="data-dir" spellcheck="false"></div>
+      <div class="field"><label for="out">Config file</label><input id="out" spellcheck="false"></div>
+      <div class="row" id="replace-row" hidden><input id="replace" type="checkbox"><label for="replace">A config file is already there. Replace it.</label></div>
+    </section>
+
+    <section data-step="4" class="stack" hidden>
+      <h2>5. Review</h2>
+      <table><tbody id="review"></tbody></table>
+      <p class="muted small">This creates the sealing key (it encrypts view keys; back it up with the database) and the admin token for the dashboard, unless they already exist, and writes the config file.</p>
+      <p id="apply-error" class="error-text" role="alert"></p>
+    </section>
+
+    <section data-step="5" class="stack" hidden>
+      <h2>Done</h2>
+      <p>The configuration is written. This setup page has closed itself.</p>
+      <div id="result" class="stack"></div>
+    </section>
+
+    <div class="row" id="nav">
+      <button class="btn" type="button" id="back" hidden>Back</button>
+      <span class="grow"></span>
+      <button class="btn primary" type="button" id="next">Next</button>
+    </div>
+  </div>
+</div>
+</body>
+</html>

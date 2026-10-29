@@ -184,6 +184,15 @@ async fn store(common: &Common) -> Result<Store> {
     Ok(open(common).await?.0)
 }
 
+/// Records a change in the audit log, as the admin API does. The actor is
+/// the local user.
+async fn audit(s: &Store, action: &str, detail: serde_json::Value) {
+    let user = std::env::var("SUDO_USER").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "unknown".into());
+    if let Err(e) = s.record_audit(&format!("cli:{user}"), "local", action, &detail.to_string()).await {
+        eprintln!("warning: could not write the audit log: {e}");
+    }
+}
+
 async fn add(
     store: &Store,
     network: Network,
@@ -292,30 +301,43 @@ pub async fn run(cmd: AdminCommand) -> Result<()> {
                 None => s.tip().await?.map(|b| b.height).unwrap_or(0),
             };
             let created = add(&s, network, &address, &view_key, start, 0, AccountStatus::Active).await?;
+            if created {
+                audit(&s, "add_account", serde_json::json!({"address": address, "start_height": start})).await;
+            }
             println!("{}", if created { format!("added, scanning from {start}") } else { "already present".into() });
         }
         AdminCommand::AcceptRequests { common, kind: k, addresses } => {
-            let done = store(&common).await?.accept_requests(kind(&k), &addresses).await?;
+            let s = store(&common).await?;
+            let done = s.accept_requests(kind(&k), &addresses).await?;
+            audit(&s, "accept_requests", serde_json::json!({"kind": k, "updated": done.len()})).await;
             println!("accepted {}", done.len());
         }
         AdminCommand::RejectRequests { common, kind: k, addresses } => {
-            let n = store(&common).await?.reject_requests(kind(&k), &addresses).await?.len();
+            let s = store(&common).await?;
+            let n = s.reject_requests(kind(&k), &addresses).await?.len();
+            audit(&s, "reject_requests", serde_json::json!({"kind": k, "updated": n})).await;
             println!("rejected {n}");
         }
         AdminCommand::SetStatus { common, status, addresses } => {
             let status: AccountStatus = status.parse().map_err(anyhow::Error::msg)?;
-            let n = store(&common).await?.set_status(&addresses, status).await?.len();
+            let s = store(&common).await?;
+            let n = s.set_status(&addresses, status).await?.len();
+            audit(&s, "set_status", serde_json::json!({"status": status_name(status), "updated": n})).await;
             println!("updated {n}");
         }
         AdminCommand::Rescan { common, height, addresses } => {
-            let n = store(&common).await?.rescan(&addresses, height).await?.len();
+            let s = store(&common).await?;
+            let n = s.rescan(&addresses, height).await?.len();
+            audit(&s, "rescan", serde_json::json!({"height": height, "updated": n})).await;
             println!("rescanning {n} account(s) from {height}");
         }
         AdminCommand::Rollback { common, height, confirm } => {
             if !confirm {
                 bail!("this deletes everything above {height} for every account; re-run with --confirm");
             }
-            let r = store(&common).await?.rollback_to(height).await?;
+            let s = store(&common).await?;
+            let r = s.rollback_to(height).await?;
+            audit(&s, "rollback", serde_json::json!({"height": height, "accounts": r.accounts})).await;
             println!("rolled back {} account(s): {} outputs, {} spends removed", r.accounts, r.outputs, r.spends);
         }
         AdminCommand::ExportAccounts { common, out } => {
@@ -341,6 +363,12 @@ pub async fn run(cmd: AdminCommand) -> Result<()> {
             };
             let json = zeroize::Zeroizing::new(serde_json::to_vec_pretty(&doc)?);
             write_secret_file(&out, &json)?;
+            audit(
+                &s,
+                "export_accounts",
+                serde_json::json!({"accounts": doc.accounts.len(), "file": out.display().to_string()}),
+            )
+            .await;
             eprintln!("wrote {} account(s) to {} -- it contains secret view keys", doc.accounts.len(), out.display());
         }
         AdminCommand::ImportAccounts { common, file } => {
@@ -362,17 +390,24 @@ pub async fn run(cmd: AdminCommand) -> Result<()> {
                 }
                 created += usize::from(add(&s, network, &r.address, &r.view_key, r.start_height, flags, status).await?);
             }
+            audit(&s, "import_accounts", serde_json::json!({"imported": created, "file": file.display().to_string()}))
+                .await;
             println!("imported {created} of {} account(s); each is rebuilt from its start height", doc.accounts.len());
         }
         AdminCommand::ImportLmdb { common, db_path } => {
             let (s, network) = open(&common).await?;
-            println!("{}", import_lmdb(&s, network, &db_path).await?);
+            let summary = import_lmdb(&s, network, &db_path).await?;
+            audit(&s, "import_lmdb", serde_json::json!({"summary": summary, "path": db_path.display().to_string()}))
+                .await;
+            println!("{summary}");
         }
         AdminCommand::Reseal(c) => {
             if c.store.allow_plaintext_keys {
                 bail!("reseal encrypts with the sealing key; drop --allow-plaintext-keys");
             }
-            let n = store(&c).await?.reseal_all().await?;
+            let s = store(&c).await?;
+            let n = s.reseal_all().await?;
+            audit(&s, "reseal", serde_json::json!({"rewritten": n, "key_id": c.store.sealing_key_id})).await;
             println!("re-sealed {n} key(s)");
         }
     }

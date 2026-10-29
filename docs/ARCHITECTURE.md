@@ -168,8 +168,21 @@ with wallet2 as ground truth and with the LMDB server:
 - **Authentication.** A view key must derive the address's public view key
   (checked by the kernel), and must equal the stored key (compared in constant
   time). Hidden and unknown accounts get the same 403.
-- **The admin API** runs on a separate listener (refused on `0.0.0.0`) and
-  needs `Authorization: Bearer`, compared in constant time.
+- **The admin API** runs on a separate listener (refused on `0.0.0.0` unless
+  `--admin-any-interface` is given for a container) and needs
+  `Authorization: Bearer`, compared in constant time.
+- **Wrong sealing key.** A check value sealed with the current key is kept in
+  the database; a server given another key refuses to start.
+- **The dashboard** is static files compiled into the binary, served under a
+  strict Content-Security-Policy (`default-src 'none'`, scripts and styles
+  from itself only, no framing). It uses bearer tokens, not cookies, so it has
+  no CSRF surface, and inserts server data as text only.
+- **Audit trail.** Every administrative change (admin API, dashboard,
+  `beldex-lws admin`) is stored with the actor, source address and details,
+  never a view key, and logged under the `audit` target.
+- **Browser setup** listens on loopback only, requires a one-time token
+  carried in the URL fragment, checks the Host header against DNS rebinding,
+  and exits after writing the configuration.
 - **Transport.** TLS is built in (rustls). Plain HTTP on a non-loopback address
   is refused unless the operator confirms a TLS proxy sits in front.
 - **Secret files** (sealing key, admin token) must be mode 0600. Exports are
@@ -200,3 +213,7 @@ with wallet2 as ground truth and with the LMDB server:
 | View keys at rest | Plaintext | Encrypted (XChaCha20-Poly1305) |
 | `locked_funds` | Master-node RPC on every request | Cached, single-flight, stale-tolerant |
 | API wire format | Reference | Same |
+| Setup | Manual flags and files | `install.sh`, `setup` (terminal or browser), `doctor` |
+| Operations UI | None | Dashboard: health, charts, accounts, requests, cluster, audit log |
+| Audit | None | Every admin change, with actor and source |
+| Metrics | None | Prometheus with latency histograms; Grafana dashboard and alert rules |

@@ -82,3 +82,28 @@ A missing or wrong bearer token gives 401; a wrong `auth` key gives 403.
 | `GET /ready` | | 200 or 503, no auth |
 
 `updated` lists the addresses that were changed. Unknown addresses are left out.
+
+### JSON API (`/api/v1`)
+
+The dashboard's API, for scripts and other tools too. Same authorisation as
+above (in practice the bearer token). Errors are `{"error": "..."}` with the
+usual status codes. View keys are never returned, and every change is
+recorded in the audit log with the caller (`token`, `admin-account <prefix>`
+or `cli:<user>`) and address.
+
+| Route | Input | Response |
+| --- | --- | --- |
+| `GET /api/v1/overview` | | Status, chain height, daemons, account and request counts, scanner lag, this process's metrics (histograms with p50/p95/p99 and raw buckets), every instance of the deployment and the scanner leases |
+| `GET /api/v1/accounts` | `q` (address prefix), `status`, `behind=true`, `limit` (≤ 500), `before` | `{accounts: [{id, address, status, admin, scan_height, behind, start_height, created_at, last_access}], next_before}`, newest first |
+| `GET /api/v1/accounts/{address}` | | One account, with its output and spend counts |
+| `POST /api/v1/accounts` | `{address, view_key, start_height?, admin?}` | 201 `{created: true, ...}`, or 200 `{created: false}` when it exists |
+| `POST /api/v1/accounts/status` | `{status, addresses}` | `{updated: [...]}` |
+| `POST /api/v1/accounts/rescan` | `{height, addresses}` | `{updated: [...]}` |
+| `GET /api/v1/requests` | | `{requests: [{kind, address, start_height, created_at}]}` |
+| `POST /api/v1/requests/accept`, `/reject` | `{kind: "create" \| "import", addresses}` | `{updated: [...]}` |
+| `GET /api/v1/audit` | `limit`, `before` | `{entries: [{id, at, actor, remote, action, detail}], next_before}`, newest first |
+| `GET /api/v1/config` | | This process's effective settings, without secrets |
+
+Address lists are limited to 10,000 per call. Pages use keyset pagination:
+pass `next_before` back as `before` until it is `null`.
+

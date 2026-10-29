@@ -8,10 +8,12 @@
 //! account creation.
 
 pub mod admin;
+pub mod admin_v1;
 pub mod daemon_data;
 pub mod error;
 pub mod limits;
 pub mod random_outs;
+pub mod ui;
 pub mod wallet;
 pub mod wire;
 
@@ -183,7 +185,9 @@ async fn guard(State(state): State<Arc<AppState>>, mut req: Request, next: Next)
 
     Metrics::add(&state.metrics.http_requests_total, 1);
     state.metrics.http_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let began = std::time::Instant::now();
     let response = next.run(req).await;
+    state.metrics.http_request_duration_seconds.observe(began.elapsed());
     state.metrics.http_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     let status = response.status();
     if status.is_client_error() {

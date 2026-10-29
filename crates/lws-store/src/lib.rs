@@ -27,6 +27,7 @@ use sqlx::sqlite::{
 use sqlx::{QueryBuilder, Row};
 
 mod sealing;
+pub use ops::{AccountCounts, AccountFilter, AccountSummary, AuditEntry, Instance, Lease};
 pub use sealing::Sealer;
 
 #[derive(Debug, thiserror::Error)]
@@ -313,6 +314,22 @@ impl Store {
             return Err(Error::UnsupportedUrl(url.to_owned()));
         };
         Ok(Store { pool, sealer })
+    }
+
+    /// Opens one connection to `url` and closes it, reporting the real cause
+    /// of a failure (refused, unknown host, authentication, missing
+    /// database) rather than a pool timeout. For setup and diagnostics.
+    pub async fn probe(url: &str, timeout: Duration) -> Result<()> {
+        use sqlx::Connection;
+        if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
+            return Err(Error::UnsupportedUrl(url.to_owned()));
+        }
+        let options = PgConnectOptions::from_str(url)?.application_name("beldex-lws-setup");
+        let conn = tokio::time::timeout(timeout, sqlx::PgConnection::connect_with(&options))
+            .await
+            .map_err(|_| Error::Db(sqlx::Error::PoolTimedOut))??;
+        conn.close().await?;
+        Ok(())
     }
 
     pub fn backend(&self) -> &'static str {
@@ -966,6 +983,8 @@ impl Store {
         Ok(())
     }
 }
+
+mod ops;
 
 #[cfg(test)]
 mod tests;
