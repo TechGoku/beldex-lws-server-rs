@@ -76,7 +76,11 @@ impl Prompt {
         if !self.interactive {
             return Ok(default.to_owned());
         }
-        eprint!("{question} [{default}]: ");
+        if default.is_empty() {
+            eprint!("{question}: ");
+        } else {
+            eprint!("{question} [{default}]: ");
+        }
         std::io::stderr().flush()?;
         let mut line = String::new();
         std::io::stdin().lock().read_line(&mut line)?;
@@ -156,10 +160,25 @@ pub async fn setup(args: SetupArgs) -> Result<()> {
                 }
                 n
             }
+            // Never guess the network: a wrong one is only caught at the first start.
             None => {
-                let n = args.network.unwrap_or(Network::Mainnet);
+                let n = match args.network {
+                    Some(n) => n,
+                    None if !prompt.interactive => {
+                        bail!("no beldexd answered at {current}; start it, or pass --network to configure without it")
+                    }
+                    None => loop {
+                        match prompt
+                            .ask("beldexd did not answer. Which network does it run? (mainnet, testnet, devnet)", "")?
+                            .parse()
+                        {
+                            Ok(n) => break n,
+                            Err(e) => eprintln!("{e}"),
+                        }
+                    },
+                };
                 eprintln!(
-                    "warning: no beldexd answered; configuring {}. Start beldexd, then run `beldex-lws doctor`.",
+                    "warning: beldexd did not answer; configuring {}. Start beldexd, then run `beldex-lws doctor`.",
                     n.daemon_name()
                 );
                 n

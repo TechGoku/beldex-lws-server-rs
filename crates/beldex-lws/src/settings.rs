@@ -83,11 +83,52 @@ pub fn local_notify_sockets(network: Network) -> Vec<PathBuf> {
         Network::Testnet => "testnet",
         Network::Devnet => "devnet",
     };
-    let mut roots = vec![PathBuf::from("/var/lib/beldex"), PathBuf::from("/var/lib/beldexd")];
+    let mut roots = running_beldexd_data_dirs();
     if let Some(home) = std::env::var_os("HOME") {
-        roots.insert(0, PathBuf::from(home).join(".beldex"));
+        roots.push(PathBuf::from(home).join(".beldex"));
     }
-    roots.into_iter().map(|r| r.join(sub).join("beldexd.sock")).collect()
+    roots.extend([PathBuf::from("/var/lib/beldex"), PathBuf::from("/var/lib/beldexd")]);
+    let mut sockets: Vec<PathBuf> = Vec::new();
+    for socket in roots.into_iter().map(|r| r.join(sub).join("beldexd.sock")) {
+        if !sockets.contains(&socket) {
+            sockets.push(socket);
+        }
+    }
+    sockets
+}
+
+/// The `--data-dir` of every beldexd running on this machine, so a daemon
+/// started with its own data directory is found too.
+fn running_beldexd_data_dirs() -> Vec<PathBuf> {
+    let Ok(procs) = std::fs::read_dir("/proc") else { return Vec::new() };
+    let mut dirs = Vec::new();
+    for entry in procs.flatten() {
+        if !entry.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else { continue };
+        let args: Vec<String> = cmdline.split(|b| *b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+        if args.first().and_then(|a| a.rsplit('/').next()) != Some("beldexd") {
+            continue;
+        }
+        if let Some(dir) = data_dir_arg(&args) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+fn data_dir_arg(args: &[String]) -> Option<PathBuf> {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--data-dir" {
+            return args.next().map(PathBuf::from);
+        }
+        if let Some(dir) = arg.strip_prefix("--data-dir=") {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    None
 }
 
 /// The first local beldexd socket this process can connect to.
@@ -642,6 +683,14 @@ mod tests {
         for url in ["http://10.0.0.2:19091", "https://node.example:443", "http://127.0.0.2:1"] {
             assert!(!is_local_url(url), "{url}");
         }
+    }
+
+    #[test]
+    fn beldexd_data_dir_arguments() {
+        let args = |a: &str| a.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(data_dir_arg(&args("beldexd --testnet --data-dir /srv/node")), Some("/srv/node".into()));
+        assert_eq!(data_dir_arg(&args("beldexd --data-dir=/srv/node --offline")), Some("/srv/node".into()));
+        assert_eq!(data_dir_arg(&args("beldexd --testnet")), None);
     }
 
     #[test]

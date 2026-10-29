@@ -7,6 +7,8 @@ const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
 let step = 0;
 let detected = null;
+// The network a daemon reported, or null while none has answered.
+let confirmed = null;
 
 function h(tag, attrs = {}, ...children) {
   const el = document.createElement(tag);
@@ -60,6 +62,8 @@ async function next() {
   try {
     if (step === 0) {
       if (!daemons().length) throw new Error('Enter at least one beldexd address.');
+      if (!confirmed) await testDaemons();
+      if (!$('#network').value) throw new Error('beldexd did not answer, so choose the network it runs.');
     }
     if (step === 1 && radio('db') === 'postgres' && !$('#pg-url').value.trim()) {
       throw new Error('Enter the PostgreSQL URL, or choose SQLite.');
@@ -102,12 +106,12 @@ async function detect() {
         h('span', {}, h('strong', {}, d.url),
           h('span', { class: 'muted small' }, `${d.network}, height ${fmt.format(d.height)}${d.syncing ? ', still syncing' : ''}${d.peers === 0 ? ', no peers' : ''}`))));
     }
-    $('#network').value = up[0].network;
+    confirmNetwork(up[0].network);
   } else {
     list.append(h('p', { class: 'small muted' }, 'No beldexd answered on the default ports of this machine. Enter its address below.'));
   }
   $('#daemons').value = up.length ? up[0].url : (detected.daemons[0] || {}).url || '';
-  if (detected.network) $('#network').value = detected.network;
+  if (detected.network && !confirmed) $('#network').value = detected.network;
   $('#data-dir').value = detected.data_dir;
   $('#out').value = detected.out;
   $('#replace-row').hidden = !detected.out_exists;
@@ -126,7 +130,16 @@ async function testDaemons() {
   out.replaceChildren(...results.map((r) => h('div', {},
     h('span', { class: `pill ${r.ok ? 'ok' : 'bad'}` }, r.ok ? `${r.network}, height ${fmt.format(r.height)}` : 'no answer'), ' ', r.url)));
   const first = results.find((r) => r.ok);
-  if (first) $('#network').value = first.network;
+  if (first) confirmNetwork(first.network);
+  else confirmed = null;
+  $('#network-hint').textContent = first
+    ? 'Taken from the daemon.'
+    : 'beldexd did not answer: choose the network it runs. The server checks it again when it starts.';
+}
+
+function confirmNetwork(network) {
+  confirmed = network;
+  $('#network').value = network;
 }
 
 // ---------------------------------------------------------------- choices
@@ -161,7 +174,7 @@ function review() {
   const p = plan();
   const accessText = { local: 'only this machine', proxy: 'internet, through a TLS proxy here', tls: 'internet, HTTPS served directly' }[p.access];
   const rows = [
-    ['Network', p.network],
+    ['Network', confirmed === p.network ? p.network : `${p.network} (not confirmed: beldexd did not answer)`],
     ['beldexd', p.daemons.join(', ')],
     ['Database', p.database ? 'PostgreSQL' : `SQLite in ${p.data_dir}`],
     ['Wallets', `${accessText}, port ${p.port}`],
@@ -210,6 +223,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#next').addEventListener('click', next);
   $('#back').addEventListener('click', () => show(Math.max(0, step - 1)));
   $('#test-daemons').addEventListener('click', () => testDaemons().catch((e) => alertOn(e.message)));
+  $('#daemons').addEventListener('input', () => { confirmed = null; });
   $('#test-db').addEventListener('click', async () => {
     const out = $('#db-result');
     out.replaceChildren('Connecting…');
