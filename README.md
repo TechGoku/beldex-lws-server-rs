@@ -65,7 +65,9 @@ docker compose -f deploy/docker-compose.yml up -d
 
 To try it without installing anything, run `./target/release/beldex-lws serve
 --network test`. It needs no config file: it keeps its database and keys in
-`~/.beldex-lws` and finds beldexd at its default port.
+`~/.beldex-lws` and finds beldexd at its default port. To call it as
+`beldex-lws` without installing, link it onto your PATH:
+`ln -s "$PWD/target/release/beldex-lws" ~/.local/bin/`.
 
 Wallets connect to `127.0.0.1:8443`. The dashboard and admin API are on
 `http://127.0.0.1:8444/`; sign in with the token in `beldex-lws-admin.token`. Wallets register themselves through `/login`. For a public
