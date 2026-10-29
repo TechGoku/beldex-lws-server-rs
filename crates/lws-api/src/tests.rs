@@ -550,6 +550,26 @@ async fn accounts_are_managed_and_audited_through_the_json_api() {
     assert_eq!((s, b["updated"].as_array().unwrap().len()), (StatusCode::OK, 1));
     let (_, inactive) = get_json(&h.admin, "/api/v1/accounts?status=inactive").await;
     assert_eq!(inactive["accounts"][0]["address"], wallets[0].address);
+
+    // Hiding through the admin API applies to a wallet whose row is cached.
+    assert_eq!(call(&h.public, "/get_address_info", creds(&wallets[1]), None).await.0, StatusCode::OK);
+    let (s, _) = call(
+        &h.admin,
+        "/api/v1/accounts/status",
+        json!({"status": "hidden", "addresses": [wallets[1].address]}),
+        TOKEN,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(call(&h.public, "/get_address_info", creds(&wallets[1]), None).await.0, StatusCode::FORBIDDEN);
+    let (s, _) = call(
+        &h.admin,
+        "/api/v1/accounts/status",
+        json!({"status": "active", "addresses": [wallets[1].address]}),
+        TOKEN,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
     let (s, b) = call(
         &h.admin,
         "/api/v1/accounts/status",
@@ -566,11 +586,14 @@ async fn accounts_are_managed_and_audited_through_the_json_api() {
 
     let (_, o) = get_json(&h.admin, "/api/v1/overview").await;
     assert_eq!((o["accounts"]["active"].as_u64(), o["accounts"]["inactive"].as_u64()), (Some(2), Some(1)));
-    assert_eq!(o["metrics"]["admin_actions_total"], 5);
+    assert_eq!(o["metrics"]["admin_actions_total"], 7);
 
     let (_, log) = get_json(&h.admin, "/api/v1/audit").await;
     let actions: Vec<&str> = log["entries"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
-    assert_eq!(actions, ["rescan", "set_status", "add_account", "add_account", "add_account"]);
+    assert_eq!(
+        actions,
+        ["rescan", "set_status", "set_status", "set_status", "add_account", "add_account", "add_account"]
+    );
     assert_eq!(log["entries"][0]["actor"], "token");
     assert_eq!(log["entries"][0]["detail"]["height"], 3);
     assert!(!log.to_string().contains(&wallets[0].view_key), "view keys never reach the audit log");

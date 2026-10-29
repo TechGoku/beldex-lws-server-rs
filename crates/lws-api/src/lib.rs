@@ -134,7 +134,10 @@ impl AppState {
         let responses = moka::future::Cache::builder()
             .weigher(|k: &String, v: &Bytes| (k.len() + v.len()).try_into().unwrap_or(u32::MAX))
             .max_capacity(config.response_cache_bytes)
-            .time_to_live(Duration::from_secs(10))
+            // Keys carry the chain tip and the account's scan state, so an
+            // entry is never served past the block it was rendered for. The
+            // TTL only frees memory early.
+            .time_to_live(Duration::from_secs(120))
             .build();
         Arc::new(AppState {
             limiter: RateLimiter::new(config.rate_limit, config.rate_burst),

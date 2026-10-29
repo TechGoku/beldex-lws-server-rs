@@ -34,27 +34,29 @@ fn hex<T: AsRef<[u8]>>(bytes: T) -> String {
     hex::encode(bytes)
 }
 
-/// Verifies credentials and loads the account. The view key must derive the
-/// address's public view key, and must equal the stored key (compared in
-/// constant time); hidden accounts are indistinguishable from unknown ones.
+/// Verifies credentials and loads the account. The view key must equal the
+/// stored key (compared in constant time). Every way an account is created
+/// checks its key against the address, so this needs no curve operation per
+/// request. Hidden accounts are indistinguishable from unknown ones.
 async fn open_account(state: &AppState, creds: &Credentials) -> ApiResult<Account> {
     let (view_public, spend_public) = lws_kernel::decode_address(&creds.address, state.config.network)
         .map_err(|_| ApiError::BadRequest("invalid address".into()))?;
     let key = hex32(&creds.view_key).ok_or_else(|| ApiError::BadRequest("invalid view key".into()))?;
-    if !lws_kernel::view_key_matches(&key, &view_public) {
-        return Err(ApiError::Forbidden);
-    }
     let address = lws_kernel::encode_address(&view_public, &spend_public, state.config.network);
     let account = state.read.account_by_address(&address).await?.ok_or(ApiError::Forbidden)?;
     let same_key: bool = account.view_key.bytes().ct_eq(&key).into();
     if !same_key || account.spend_public != spend_public || account.status == AccountStatus::Hidden {
         return Err(ApiError::Forbidden);
     }
-    let primary = state.primary.clone();
-    let id = account.id;
-    tokio::spawn(async move {
-        let _ = primary.touch(id, now_secs()).await;
-    });
+    // At most one write a minute per account, however often the wallet polls.
+    let now = now_secs();
+    if account.last_access < now - 60 {
+        let primary = state.primary.clone();
+        let id = account.id;
+        tokio::spawn(async move {
+            let _ = primary.touch(id, now).await;
+        });
+    }
     Ok(account)
 }
 

@@ -211,9 +211,25 @@ with wallet2 as ground truth and with the LMDB server:
 | Scaling | One process | API replicas plus scanner shards with leases |
 | Scan cost | ref10 per account | Shared per-tx tables (about 4.7x), all cores |
 | View keys at rest | Plaintext | Encrypted (XChaCha20-Poly1305) |
-| `locked_funds` | Master-node RPC on every request | Cached, single-flight, stale-tolerant |
+| `locked_funds` | Master-node list cached 10 s; requests fail once beldexd is down | Cached, single-flight, served stale for 2 min while beldexd is down |
 | API wire format | Reference | Same |
 | Setup | Manual flags and files | `install.sh`, `setup` (terminal or browser), `doctor` |
 | Operations UI | None | Dashboard: health, charts, accounts, requests, cluster, audit log |
 | Audit | None | Every admin change, with actor and source |
 | Metrics | None | Prometheus with latency histograms; Grafana dashboard and alert rules |
+
+Measured on the development machine (12 threads; the load generator, the
+database and both servers on the same machine; 20,000 accounts polled in turn
+with `get_address_info` and `get_address_txs`; runs vary by about 20%):
+
+| | LMDB server | beldex-lws (PostgreSQL) |
+| --- | --- | --- |
+| Account-transaction checks per second, 12 threads | 33,000 | 184,000 |
+| Wallet polls served per second, response cache on | 39,000 | 31,000–38,000 |
+| Wallet polls served per second, response cache off | 32,000–41,000 | 16,000–20,000 |
+| Machines that can share the work | 1 | API replicas and scanner shards on any number |
+
+On a single machine the LMDB server answers a poll faster: it reads a
+memory-mapped file in-process, where beldex-lws makes a query to PostgreSQL.
+What beldex-lws adds is scan throughput per core and the ability to spread
+both scanning and serving over many machines.
