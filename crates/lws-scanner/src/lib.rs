@@ -369,6 +369,8 @@ impl Scanner {
         if accounts.is_empty() {
             let info = self.daemon.get_info().await?;
             Metrics::set(&self.metrics.daemon_height, info.height);
+            // Nothing to scan is caught up, not behind by the whole chain.
+            Metrics::set(&self.metrics.min_scan_height, info.height.saturating_sub(1));
             return Ok(false);
         }
         Metrics::set(&self.metrics.min_scan_height, accounts.iter().map(|a| a.scan_height).min().unwrap_or(0));
