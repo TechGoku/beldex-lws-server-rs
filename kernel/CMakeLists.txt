@@ -43,6 +43,9 @@ ExternalProject_Add(beldex_core
     -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
     -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+    # beldex core defaults to -march=native, which makes a release archive,
+    # Docker image or CI cache crash on any CPU older than the build machine's.
+    -DARCH=default
     -DBUILD_TESTS=OFF
     -DBUILD_DOCUMENTATION=OFF
     -DUSE_READLINE=OFF
