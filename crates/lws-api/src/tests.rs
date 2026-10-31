@@ -33,7 +33,23 @@ async fn mock_daemon() -> String {
                 let n = req["params"]["output_indices"].as_array().map(Vec::len).unwrap_or(0);
                 json!({"outs": (0..n).map(|i| json!({"key": hex::encode([i as u8; 32]), "mask": hex::encode([7u8; 32]), "unlocked": true})).collect::<Vec<_>>()})
             }
-            "send_raw_transaction" => json!({"status": "OK"}),
+            // The hex picks the daemon's answer, so a test can ask for each one.
+            "send_raw_transaction" => match req["params"]["tx"].as_str().unwrap() {
+                "0d0d" => json!({"status": "FAILED", "reason": "Double spend TX, TX should NOT be relayed",
+                    "reason_codes": ["not_relayed", "failed", "double_spend"]}),
+                "0e0e" => {
+                    json!({"status": "FAILED", "reason": "TX should NOT be relayed", "reason_codes": ["not_relayed"]})
+                }
+                "0f0f" => json!({"status": "FAILED", "reason": format!("ringct failed{}", "x".repeat(600)),
+                    "reason_codes": ["not_relayed", "failed"]}),
+                "1010" => json!({"status": "FAILED", "reason": "Flash quorum timeout", "flash_status": 3}),
+                "1111" => json!({"status": "FAILED", "reason": "quorum said no", "flash_status": 1}),
+                "1212" => json!({"status": "BUSY"}),
+                "1515" => json!({"status": "FAILED", "reason": "Something new"}),
+                "1313" => json!({"nonsense": true}),
+                "1414" => return axum::Json(json!({"error": {"code": -32602, "message": "bad params"}})),
+                _ => json!({"status": "OK"}),
+            },
             "get_token_info" => return axum::Json(json!({"error": {"code": -1, "message": "not found"}})),
             other => panic!("unexpected daemon call {other}"),
         };
@@ -327,6 +343,70 @@ async fn decoys_and_submission() {
     assert_eq!((s, d["state"].as_str(), d["network"].as_str()), (StatusCode::OK, Some("ok"), Some("test")));
     let (s, _) = call(&h.public, "/get_token_info", json!({"token_id": hex::encode([1; 32])}), None).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "unknown token");
+}
+
+#[tokio::test]
+async fn submit_failures_explain_themselves_and_are_never_200() {
+    let h = harness(Config::default()).await;
+    let cases = [
+        ("0d0d", StatusCode::INTERNAL_SERVER_ERROR, "double_spend", false),
+        ("0e0e", StatusCode::INTERNAL_SERVER_ERROR, "not_relayed", true),
+        ("0f0f", StatusCode::INTERNAL_SERVER_ERROR, "failed", false),
+        ("1010", StatusCode::INTERNAL_SERVER_ERROR, "flash_timeout", true),
+        ("1111", StatusCode::INTERNAL_SERVER_ERROR, "flash_rejected", false),
+        ("1212", StatusCode::INTERNAL_SERVER_ERROR, "daemon_busy", false),
+        ("1515", StatusCode::INTERNAL_SERVER_ERROR, "rejected", false),
+        ("1313", StatusCode::INTERNAL_SERVER_ERROR, "bad_daemon_response", true),
+        ("1414", StatusCode::SERVICE_UNAVAILABLE, "daemon_error", false),
+        ("zz", StatusCode::BAD_REQUEST, "invalid_request", false),
+    ];
+    for (tx, http, code, may_be_sent) in cases {
+        let (s, b) = call(&h.public, "/submit_raw_tx", json!({"tx": tx}), None).await;
+        assert_eq!(s, http, "{tx}");
+        assert_eq!(b["status"], "FAILED", "{tx}");
+        assert_eq!(b["code"], code, "{tx}");
+        assert_eq!(b["may_be_sent"], may_be_sent, "{tx}");
+        let message = b["Error"].as_str().unwrap();
+        assert!(!message.is_empty(), "{tx}");
+        assert_eq!(b["error"].as_str(), Some(message), "{tx}");
+    }
+
+    let (_, b) = call(&h.public, "/submit_raw_tx", json!({"tx": "0d0d"}), None).await;
+    assert!(b["reason"].as_str().unwrap().starts_with("Double spend TX"));
+    assert_eq!(b["reason_codes"].as_array().unwrap().len(), 3);
+    assert!(b["Error"].as_str().unwrap().contains("already spent"));
+    let (_, b) = call(&h.public, "/submit_raw_tx", json!({"tx": "0f0f"}), None).await;
+    assert_eq!(b["reason"].as_str().unwrap().chars().count(), 500, "daemon text is bounded");
+    let (_, b) = call(&h.public, "/submit_raw_tx", json!({"tx": "1010", "fee": "5"}), None).await;
+    assert_eq!(b["flash_status"], 3);
+
+    // The body of a success is exactly what wallets have always received.
+    let resp = h
+        .public
+        .clone()
+        .oneshot(HttpRequest::post("/submit_raw_tx").body(Body::from(r#"{"tx":"0102"}"#)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "application/json");
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&bytes[..], br#"{"status":"OK"}"#);
+
+    // Nothing is listening here, so the daemon's outcome cannot be known.
+    let down = Arc::new(
+        Daemon::new(&["http://127.0.0.1:9".to_owned()], Duration::from_secs(1), Duration::from_secs(1)).unwrap(),
+    );
+    let state = AppState::new(
+        Config { network: NET, ..Config::default() },
+        h.state.primary.clone(),
+        h.state.read.clone(),
+        down,
+        Arc::new(Metrics::default()),
+    );
+    let (s, b) = call(&public_router(state), "/submit_raw_tx", json!({"tx": "0102"}), None).await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!((b["code"].as_str(), b["may_be_sent"].as_bool()), (Some("daemon_unavailable"), Some(true)));
+    assert!(!b.to_string().contains("127.0.0.1"), "daemon addresses stay out of the reply: {b}");
 }
 
 #[tokio::test]

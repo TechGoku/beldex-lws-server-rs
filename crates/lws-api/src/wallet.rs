@@ -6,7 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::extract::{Extension, State};
-use axum::response::Response;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use lws_core::{
     account_flags, is_locked, iso_timestamp, now_secs, Account, AccountStatus, Key, Output, OutputRef, Request,
@@ -805,21 +806,127 @@ pub async fn import_request(State(state): State<Arc<AppState>>, body: Bytes) -> 
     )?))
 }
 
-pub async fn submit_raw_tx(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResult<Response> {
-    let req: SubmitRequest = parse(&body)?;
+/// beldexd's `reason_codes`, most specific first, with what to tell the user.
+/// `not_relayed` comes with every rejection, so it only counts alone.
+const REJECTIONS: &[(&str, &str)] = &[
+    ("double_spend", "Transaction rejected: these funds are already spent. Refresh the wallet and try again."),
+    ("overspend", "Transaction rejected: it spends more than its inputs hold."),
+    ("fee_too_low", "Transaction rejected: the fee is too low."),
+    ("mixin", "Transaction rejected: it has the wrong number of decoys."),
+    ("invalid_input", "Transaction rejected: one or more inputs are invalid."),
+    ("invalid_output", "Transaction rejected: one or more outputs are invalid."),
+    ("too_few_outputs", "Transaction rejected: it has too few outputs."),
+    ("too_big", "Transaction rejected: it is too large."),
+    ("invalid_version", "Transaction rejected: its version is not valid now. The wallet may need an update."),
+    ("invalid_type", "Transaction rejected: its type is not valid."),
+    ("mnode_locked", "Transaction rejected: these funds are staked to a master node."),
+    ("blacklisted", "Transaction rejected: these funds are in a master node penalty period."),
+    ("altchain", "Transaction rejected: it spends outputs on another chain. Refresh the wallet and try again."),
+    ("failed", "Transaction rejected: it failed verification on the Beldex node."),
+];
+
+/// Longest daemon text passed on to a wallet, which may show it as is.
+const MAX_REASON_CHARS: usize = 500;
+
+/// A failed submission. Always a non-200: wallets take any 200 as sent without
+/// reading the body. `Error` is the field the `@bdxi` web and mobile clients
+/// show, `error` the one beldex core's light wallet reads, and `may_be_sent`
+/// says the transaction could still reach the network, so sending it again
+/// could pay twice unless the wallet checks first.
+fn submit_failure(
+    http: StatusCode,
+    code: &str,
+    message: &str,
+    may_be_sent: bool,
+    details: Option<(&str, &Json)>,
+) -> Response {
+    let mut body =
+        json!({"status": "FAILED", "code": code, "Error": message, "error": message, "may_be_sent": may_be_sent});
+    if let Some((reason, result)) = details {
+        body["reason"] = reason.into();
+        for field in ["reason_codes", "flash_status"] {
+            if let Some(value) = result.get(field) {
+                body[field] = value.clone();
+            }
+        }
+    }
+    (http, axum::Json(body)).into_response()
+}
+
+/// Turns beldexd's verdict on a transaction it did not accept into the reply.
+fn submit_rejected(result: &Json) -> Response {
+    let reason: String =
+        result.get("reason").and_then(Json::as_str).unwrap_or_default().trim().chars().take(MAX_REASON_CHARS).collect();
+    let codes: Vec<&str> =
+        result.get("reason_codes").and_then(Json::as_array).into_iter().flatten().filter_map(Json::as_str).collect();
+    warn!(%reason, ?codes, status = ?result.get("status"), "daemon rejected submitted transaction");
+
+    let reply = |code, message: &str, may_be_sent| {
+        submit_failure(StatusCode::INTERNAL_SERVER_ERROR, code, message, may_be_sent, Some((&reason, result)))
+    };
+    if let Some((code, message)) = REJECTIONS.iter().find(|(code, _)| codes.contains(code)) {
+        return reply(code, message, false);
+    }
+    // beldexd's flash_result: 1 rejected, 3 timeout. A timed-out flash can still
+    // have reached the network.
+    match result.get("flash_status").and_then(Json::as_u64) {
+        Some(3) => {
+            return reply(
+                "flash_timeout",
+                "The flash quorum did not answer in time. The transaction may still go through, so check the wallet before sending again.",
+                true,
+            )
+        }
+        Some(1) => return reply("flash_rejected", "Transaction rejected by the flash quorum.", false),
+        _ => {}
+    }
+    match result.get("status").and_then(Json::as_str) {
+        Some("BUSY") => reply("daemon_busy", "The Beldex node is still syncing. Try again shortly.", false),
+        Some("FAILED") if codes == ["not_relayed"] => reply(
+            "not_relayed",
+            "The Beldex node did not relay this transaction, possibly because it already has it. Check the wallet before sending again.",
+            true,
+        ),
+        Some("FAILED") if !reason.is_empty() => reply("rejected", &format!("Transaction rejected: {reason}"), false),
+        Some("FAILED") => reply("rejected", "Transaction rejected by the Beldex node.", false),
+        _ => reply(
+            "bad_daemon_response",
+            "The Beldex node gave an unexpected answer. Check the wallet before sending again.",
+            true,
+        ),
+    }
+}
+
+pub async fn submit_raw_tx(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let invalid = |message: &str| submit_failure(StatusCode::BAD_REQUEST, "invalid_request", message, false, None);
+    let req: SubmitRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(e) => return invalid(&format!("invalid request: {e}")),
+    };
     if req.tx.is_empty() || !req.tx.len().is_multiple_of(2) || !req.tx.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(ApiError::BadRequest("tx must be hex".into()));
+        return invalid("tx must be hex");
     }
     let flash = req.fee.as_deref() == Some("5");
-    let result = state.daemon.daemon.send_raw_transaction(&req.tx, flash).await?;
-    let status = result.get("status").and_then(Json::as_str).unwrap_or("");
-    if status != "OK" {
-        let reason = result.get("reason").and_then(Json::as_str).unwrap_or("(none given)").to_owned();
-        let codes = result.get("reason_codes").cloned().unwrap_or(Json::Null);
-        warn!(%reason, %codes, "daemon rejected submitted transaction");
-        return Err(ApiError::TxRejected(reason));
+    let result = match state.daemon.daemon.send_raw_transaction(&req.tx, flash).await {
+        Ok(result) => result,
+        // The daemon refused the call itself, so the transaction went nowhere.
+        Err(e @ lws_daemon::Error::Rpc { .. }) => {
+            warn!(error = %e, "daemon refused submit_raw_tx");
+            let message = "The Beldex node could not process this transaction.";
+            return submit_failure(StatusCode::SERVICE_UNAVAILABLE, "daemon_error", message, false, None);
+        }
+        // Includes a timeout after the daemon took the transaction. The detail
+        // names daemon addresses, so it stays in the log.
+        Err(e) => {
+            warn!(error = %e, "submit_raw_tx: no answer from daemon");
+            let message = "No answer from the Beldex node, so this transaction may or may not have been sent. Check the wallet before sending again.";
+            return submit_failure(StatusCode::SERVICE_UNAVAILABLE, "daemon_unavailable", message, true, None);
+        }
+    };
+    if result.get("status").and_then(Json::as_str) != Some("OK") {
+        return submit_rejected(&result);
     }
-    Ok(json_response(json_bytes(&state, &json!({"status": "OK"}))?))
+    (StatusCode::OK, axum::Json(json!({"status": "OK"}))).into_response()
 }
 
 pub async fn daemon_status(State(state): State<Arc<AppState>>) -> ApiResult<Response> {

@@ -19,8 +19,6 @@ pub enum ApiError {
     RateLimited { retry_after: u64 },
     #[error("unavailable: {0}")]
     Unavailable(String),
-    #[error("daemon rejected the transaction: {0}")]
-    TxRejected(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -33,7 +31,7 @@ impl ApiError {
             ApiError::NotImplemented => StatusCode::NOT_IMPLEMENTED,
             ApiError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
-            ApiError::TxRejected(_) | ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
