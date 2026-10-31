@@ -49,7 +49,7 @@ install it fresh as a service and bring the accounts along with
 ## Quick start
 
 ```bash
-git clone --recursive <this repo> && cd beldex-lws-scalable
+git clone --recursive https://github.com/TechGoku/beldex-lws-server-rs.git && cd beldex-lws-server-rs
 make release                 # builds beldex core, the kernel and the server
 sudo ./deploy/install.sh     # installs, configures and starts the systemd service
 ```
