@@ -382,6 +382,9 @@ service user): it names most of the problems below directly.
   that includes it, then rebuild. The scanner stops rather than skip data.
 - **`not JSON ... is the daemon URL right?`**: `--daemon` points at something
   that is not `beldexd` RPC.
+- **A wallet says a transaction was rejected**: the reply's `code` says why (see
+  [API.md](API.md#submit_raw_tx)), and the log has a `daemon rejected submitted
+  transaction` line with `beldexd`'s full reason.
 - **Many 503s with `http_shed_total` rising**: the replica is at
   `--max-in-flight`. Add replicas, or raise the limit if CPU and the database
   have headroom.
