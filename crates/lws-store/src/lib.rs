@@ -365,6 +365,19 @@ impl Store {
         dispatch!(self, pool => pool.close().await)
     }
 
+    /// Writes a consistent copy of a SQLite database to `path`, which must
+    /// not exist or be empty, while the database stays in use. Returns false
+    /// for PostgreSQL, which is backed up with its own tools.
+    pub async fn sqlite_backup(&self, path: &str) -> Result<bool> {
+        match &self.pool {
+            Pool::Sqlite(pool) => {
+                sqlx::query("VACUUM INTO $1").bind(path).execute(pool).await?;
+                Ok(true)
+            }
+            Pool::Postgres(_) => Ok(false),
+        }
+    }
+
     // ---------------------------------------------------------------- meta
 
     pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {
@@ -566,15 +579,19 @@ impl Store {
     }
 
     /// Active accounts for the scanner. With `shard = Some((index, count))`
-    /// only accounts whose id falls in that shard are returned.
-    pub async fn scan_targets(&self, shard: Option<(u32, u32)>) -> Result<Vec<Account>> {
+    /// only accounts whose id falls in that shard are returned. Accounts last
+    /// used before `used_since` are idle: left out until a wallet uses them
+    /// again, when they resume from their scan height and catch up.
+    pub async fn scan_targets(&self, shard: Option<(u32, u32)>, used_since: Option<i64>) -> Result<Vec<Account>> {
         let (index, count) = shard.unwrap_or((0, 1));
         dispatch!(self, pool => {
             let rows = sqlx::query(&format!(
-                "SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE status = $1 AND (id % $2) = $3 ORDER BY scan_height, id"))
+                "SELECT {ACCOUNT_COLUMNS} FROM accounts \
+                 WHERE status = $1 AND (id % $2) = $3 AND last_access >= $4 ORDER BY scan_height, id"))
                 .bind(AccountStatus::Active.to_db())
                 .bind(i64::from(count.max(1)))
                 .bind(i64::from(index))
+                .bind(used_since.unwrap_or(i64::MIN))
                 .fetch_all(pool).await?;
             rows.iter().map(|r| account_from_row(&self.sealer, r)).collect()
         })

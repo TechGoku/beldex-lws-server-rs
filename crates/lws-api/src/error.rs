@@ -58,9 +58,11 @@ impl From<lws_daemon::Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status();
+        // Rate-limited requests are only counted, and `maintenance` logs one
+        // summary a minute, so a request flood does not become a log flood.
         if status.is_server_error() {
             error!(error = %self, "request failed");
-        } else {
+        } else if status != StatusCode::TOO_MANY_REQUESTS {
             warn!(error = %self, status = status.as_u16(), "request refused");
         }
         let mut response = (status, status.canonical_reason().unwrap_or("")).into_response();

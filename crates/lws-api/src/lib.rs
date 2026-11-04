@@ -299,6 +299,7 @@ pub(crate) fn json_response(bytes: Bytes) -> Response {
 pub async fn maintenance(state: Arc<AppState>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let mut height_tick = tokio::time::interval(Duration::from_secs(5));
     let mut sweep_tick = tokio::time::interval(Duration::from_secs(60));
+    let mut limited_seen = Metrics::get(&state.metrics.http_rate_limited_total);
     loop {
         tokio::select! {
             _ = height_tick.tick() => {
@@ -308,6 +309,11 @@ pub async fn maintenance(state: Arc<AppState>, mut shutdown: tokio::sync::watch:
                 }
             }
             _ = sweep_tick.tick() => {
+                let limited = Metrics::get(&state.metrics.http_rate_limited_total);
+                if limited > limited_seen {
+                    tracing::warn!(requests = limited - limited_seen, "rate limited requests in the last minute");
+                }
+                limited_seen = limited;
                 state.limiter.sweep();
                 state.creation_limiter.sweep();
             }

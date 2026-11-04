@@ -57,6 +57,9 @@ pub struct Config {
     /// on the ones it flags. Off means every account goes through the kernel.
     pub fast_prefilter: bool,
     pub lease_ttl: Duration,
+    /// Accounts no wallet has used for this long are not scanned until one
+    /// does (None: scan every active account).
+    pub idle_after: Option<Duration>,
     /// Identifies this process as a lease holder.
     pub instance: String,
 }
@@ -75,6 +78,7 @@ impl Default for Config {
             accounts_per_task: 256,
             fast_prefilter: true,
             lease_ttl: Duration::from_secs(30),
+            idle_after: None,
             instance: format!("pid-{}", std::process::id()),
         }
     }
@@ -364,7 +368,11 @@ impl Scanner {
     /// One pass over every lane. Returns whether anything was committed.
     pub async fn pass(&self) -> anyhow::Result<bool> {
         Metrics::add(&self.metrics.scan_passes_total, 1);
-        let accounts = self.store.scan_targets(self.config.shard).await?;
+        let used_since = self
+            .config
+            .idle_after
+            .map(|d| lws_core::now_secs().saturating_sub(i64::try_from(d.as_secs()).unwrap_or(i64::MAX)));
+        let accounts = self.store.scan_targets(self.config.shard, used_since).await?;
         Metrics::set(&self.metrics.scanned_accounts, accounts.len() as u64);
         if accounts.is_empty() {
             let info = self.daemon.get_info().await?;

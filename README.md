@@ -83,6 +83,10 @@ beldex-lws --version
 The first build also compiles beldex core, so it takes several minutes and a
 fair amount of memory. The last line should print the version.
 
+`make release NATIVE=1` instead compiles for this machine's CPU and scans a few
+percent faster. Use it only for a binary that stays on the machine that built
+it: on an older CPU it crashes.
+
 ### 4. Set up
 
 This asks three questions. Press Enter to accept a default:
@@ -187,6 +191,25 @@ The dashboard shows health, live charts, accounts, requests and the audit log.
 
 ## Other ways to run it
 
+### From a release, without building
+
+Each release on the [releases page](https://github.com/TechGoku/beldex-lws-server-rs/releases)
+has a ready-built archive for Ubuntu 24.04 on x86-64. It replaces steps 2 and 3
+and installs the systemd service described below:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y curl libsodium23 libzmq5 libboost-serialization1.83.0 libboost-program-options1.83.0
+cd ~
+VERSION=0.1.0
+curl -LO "https://github.com/TechGoku/beldex-lws-server-rs/releases/download/v$VERSION/beldex-lws-$VERSION-linux-x86_64.tar.gz"
+tar xzf "beldex-lws-$VERSION-linux-x86_64.tar.gz"
+cd "beldex-lws-$VERSION"
+sudo ./install.sh
+```
+
+Set `VERSION` to the newest release. On other systems, build from source.
+
 ### As a systemd service
 
 Use this for a server that should keep running and start at boot. Do steps 1 to
@@ -237,7 +260,10 @@ cd ~/beldex-lws-server-rs
 cp deploy/.env.example deploy/.env
 ```
 
-Open `deploy/.env` and set the network and the address of `beldexd`. Then start it:
+Open `deploy/.env` and set the network and the address of `beldexd`. The first
+start builds the image. To use the published image instead, uncomment
+`LWS_IMAGE` in `deploy/.env` and run
+`docker compose -f deploy/docker-compose.yml pull` first. Then start it:
 
 ```bash
 docker compose -f deploy/docker-compose.yml up -d
@@ -339,6 +365,17 @@ Stop scanning an account:
 beldex-lws admin --config ~/.beldex-lws/lws.toml set-status inactive <address>
 ```
 
+Back up the database while the server keeps running. The copy can only be read
+by you:
+
+```bash
+mkdir -p ~/lws-backups
+beldex-lws admin --config ~/.beldex-lws/lws.toml backup ~/lws-backups/lws-$(date +%F).db
+```
+
+The sealing key, `~/.beldex-lws/beldex-lws-seal.key`, is not in the backup. Copy it
+somewhere safe once: without it the backup's view keys cannot be read.
+
 `beldex-lws --help` lists everything, and every option can go in the config file
 or an `LWS_*` environment variable.
 
@@ -401,6 +438,8 @@ admin API.
 | A wallet is missing older funds | New accounts start at the current height. Approve a rescan as in step 6 |
 | `403` on every wallet call | The account is unknown or hidden, or the view key is wrong |
 | A send fails | The reply's `code` and the server log's `daemon rejected submitted transaction` line give the reason |
+| `rate limited requests in the last minute` in the log | Clients went over `rate-limit` (20 a second per IP). Normal for a load test from one machine. Raise `rate-limit` and `rate-burst` in the config, or set `rate-limit = 0` while testing |
+| A wallet takes a while to show its balance after months away | With `idle-after-days` set, its account was parked. It catches up on its own within minutes of the wallet opening it |
 
 [docs/OPERATIONS.md](docs/OPERATIONS.md#troubleshooting) covers more cases.
 

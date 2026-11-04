@@ -394,6 +394,7 @@ pub fn write_plan(plan: &Plan) -> Result<Written> {
     text.push_str("# rate-limit = 20           # requests/second per client\n");
     text.push_str("# max-in-flight = 4096\n");
     text.push_str("# scan-threads = <all cores>\n");
+    text.push_str("# idle-after-days = 0       # stop scanning wallets unused this long (0 = never)\n");
     text.push_str("# audit-retention-days = 365\n");
     text.push_str("# log-format = \"text\"       # or \"json\"\n");
 

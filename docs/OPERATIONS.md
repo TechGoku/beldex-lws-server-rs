@@ -5,8 +5,17 @@
 Every way of running it needs a `beldexd` on the same network, reachable over
 RPC (synced, for mainnet).
 
-**Linux server with systemd (recommended).** From a release archive (`make
-dist` builds one) or a source tree after `make release`:
+**Linux server with systemd (recommended).** From a release archive or a
+source tree after `make release`. Each `v*` tag publishes an archive on the
+[releases page](https://github.com/TechGoku/beldex-lws-server-rs/releases),
+built on Ubuntu 24.04 for any x86-64 CPU (`make dist` builds the same locally).
+It needs only the runtime libraries:
+
+```bash
+sudo apt-get install -y libsodium23 libzmq5 libboost-serialization1.83.0 libboost-program-options1.83.0
+```
+
+Then, from the unpacked archive or the source tree:
 
 ```bash
 sudo ./install.sh
@@ -28,6 +37,9 @@ It installs to `/opt/beldex-lws`, creates the `beldex-lws` system user, runs
 `sudo make install ARGS="--yes"` does the same from a source tree.
 
 **Docker.** No files to prepare: keys are created in a volume on first start.
+Compose builds the image, or set `LWS_IMAGE=ghcr.io/techgoku/beldex-lws:latest`
+in `deploy/.env` and run `docker compose -f deploy/docker-compose.yml pull` to
+use the one each release publishes.
 
 ```bash
 cp deploy/.env.example deploy/.env      # network, beldexd address, domain
@@ -104,6 +116,12 @@ SQLite, as `install.sh` sets up.
   sets `X-Forwarded-For`.
 - Size scanner shards with `make bench`: shards needed ≈ (active accounts ×
   transactions per block) ÷ (measured checks per second × 30 s), plus headroom.
+  `--idle-after-days` lowers the number of active accounts (see
+  [Account policy](#account-policy)).
+- Release archives and the Docker image are built for any x86-64 CPU. A
+  source build with `make release NATIVE=1` is compiled for the build
+  machine's CPU and scans a few percent faster, but may crash on another
+  machine: build it where it runs, and never copy it elsewhere.
 - Two processes with the same `--scan-shard` are safe: one holds the lease and
   the other waits as a hot standby, taking over within the lease TTL (30 s).
 - Changing the shard count is safe at any time. Shards are leased by name
@@ -213,6 +231,13 @@ Binding it to `0.0.0.0` is refused.
 - Import requests (rescan from genesis) need approval unless
   `--auto-accept-imports` is set. Leave that off on public servers: a
   full-history rescan is expensive, and anyone holding a view key can ask for one.
+- `--idle-after-days N` (default 0, off): accounts no wallet has opened for
+  N days are not scanned. Scan cost grows with the number of scanned
+  accounts, and on a public server most accounts are never opened again. When
+  a wallet opens an idle account, the scanner picks it up within a few
+  seconds and catches it up from where it stopped; until then the wallet sees
+  `scanned_height` behind `blockchain_height`, as for any account that is
+  syncing. Accounts added by an operator count as opened when added.
 
 ## Administration
 
@@ -229,18 +254,35 @@ beldex-lws admin rollback 1234000 --confirm          # every account, as after a
 beldex-lws admin export-accounts accounts.json       # contains view keys; 0600
 beldex-lws admin import-accounts accounts.json
 beldex-lws admin reseal
+beldex-lws admin backup /backups/lws-$(date +%F).db   # consistent copy; 0600
 ```
 
 The admin HTTP API offers the same operations (see [API.md](API.md)).
 
 ## Backups and recovery
 
-- **PostgreSQL:** use the usual tools (`pg_basebackup` with WAL archiving for
-  point-in-time recovery, or streaming replicas). Everything in the database
-  can be rebuilt from the chain, so the essentials are the accounts table and
-  the sealing key.
-- **SQLite:** `sqlite3 lws.db ".backup /backups/lws-$(date +%F).db"` is safe
-  while the server runs (the database is in WAL mode).
+Back up the sealing key once, separately from the database: without it the
+view keys in a backup cannot be read, and anyone holding both can read them.
+
+- **`beldex-lws admin backup FILE`** works with either database while the
+  server runs, and writes a new file readable only by its owner. With SQLite
+  it is a ready-to-use copy of the database; with PostgreSQL it runs
+  `pg_dump` (install the PostgreSQL client tools) and writes a custom-format
+  archive. A daily copy, kept for two weeks, from the `beldex-lws` user's
+  crontab:
+
+  ```cron
+  15 3 * * * /opt/beldex-lws/bin/beldex-lws admin --config /etc/beldex-lws/lws.toml backup /var/backups/beldex-lws/lws-$(date +\%F).db && find /var/backups/beldex-lws -name 'lws-*' -mtime +14 -delete
+  ```
+
+- **Restoring SQLite:** stop the server, replace the database file
+  (`beldex-lws.sqlite` in the data directory) with the copy, start it. The
+  scanner continues from the copy's heights.
+- **Restoring PostgreSQL:** `pg_restore --clean --if-exists -d <database> FILE`
+  with the server stopped.
+- **PostgreSQL at scale:** `pg_basebackup` with WAL archiving gives
+  point-in-time recovery. Everything in the database can be rebuilt from the
+  chain, so the essentials are the accounts table and the sealing key.
 - **Full rebuild:** `export-accounts` on the old database, `import-accounts`
   into a new one. Every account rescans from its start height.
 

@@ -104,6 +104,15 @@ pub enum AdminCommand {
     },
     /// Re-encrypt every stored view key with the current sealing key.
     Reseal(Common),
+    /// Write a consistent copy of the database to a new 0600 file while the
+    /// server keeps running: a SQLite file, or a pg_dump custom-format
+    /// archive for PostgreSQL (pg_dump must be installed). The sealing key is
+    /// not included; back it up separately.
+    Backup {
+        #[command(flatten)]
+        common: Common,
+        out: PathBuf,
+    },
 }
 
 /// The export document. Field-compatible with `beldex-lws-admin
@@ -153,6 +162,39 @@ fn status_name(s: AccountStatus) -> &'static str {
         AccountStatus::Inactive => "inactive",
         AccountStatus::Hidden => "hidden",
     }
+}
+
+/// Runs pg_dump against `url`, passing the password through the environment
+/// so it does not show in the process list.
+fn pg_dump(url: &str, out: &std::path::Path) -> Result<()> {
+    let mut url = reqwest::Url::parse(url).context("parsing the database URL")?;
+    let password = url.password().map(percent_decode).transpose()?;
+    let _ = url.set_password(None);
+    let mut cmd = std::process::Command::new("pg_dump");
+    cmd.arg("--format=custom").arg("--file").arg(out).arg("--dbname").arg(url.as_str());
+    if let Some(p) = password {
+        cmd.env("PGPASSWORD", p);
+    }
+    let status = cmd.status().context("running pg_dump (install the PostgreSQL client tools)")?;
+    if !status.success() {
+        bail!("pg_dump failed ({status})");
+    }
+    Ok(())
+}
+
+fn percent_decode(s: &str) -> Result<String> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut bytes = s.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let hi = bytes.next().context("bad escape in the database password")?;
+            let lo = bytes.next().context("bad escape in the database password")?;
+            out.extend(hex::decode([hi, lo]).context("bad escape in the database password")?);
+        } else {
+            out.push(b);
+        }
+    }
+    String::from_utf8(out).context("database password is not UTF-8")
 }
 
 fn kind(name: &str) -> RequestKind {
@@ -409,6 +451,27 @@ pub async fn run(cmd: AdminCommand) -> Result<()> {
             let n = s.reseal_all().await?;
             audit(&s, "reseal", serde_json::json!({"rewritten": n, "key_id": c.store.sealing_key_id})).await;
             println!("re-sealed {n} key(s)");
+        }
+        AdminCommand::Backup { common, out } => {
+            let mut args = common.store.clone();
+            args.resolve()?;
+            let s = store(&common).await?;
+            // Created empty first so the copy is never readable by other users.
+            write_secret_file(&out, b"")?;
+            let written = match s.sqlite_backup(&out.display().to_string()).await {
+                Ok(true) => Ok(()),
+                Ok(false) => pg_dump(args.url(), &out),
+                Err(e) => Err(e.into()),
+            };
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&out);
+                return Err(e);
+            }
+            audit(&s, "backup", serde_json::json!({"file": out.display().to_string()})).await;
+            println!("wrote {}", out.display());
+            if let Some(key) = &args.sealing_key_file {
+                eprintln!("The sealing key is not in the backup. Keep a copy of {} with it.", key.display());
+            }
         }
     }
     Ok(())

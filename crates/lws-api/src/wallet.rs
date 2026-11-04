@@ -731,6 +731,7 @@ pub async fn login(
         return Err(ApiError::NotImplemented);
     }
     if let Err(retry_after) = state.creation_limiter.check(ClientKey::from(ip), 1.0) {
+        lws_core::metrics::Metrics::add(&state.metrics.http_rate_limited_total, 1);
         return Err(ApiError::RateLimited { retry_after });
     }
 

@@ -279,6 +279,7 @@ async fn serve(mut args: ServeArgs) -> Result<()> {
             accounts_per_task: 256,
             fast_prefilter: !args.no_fast_scan,
             lease_ttl: Duration::from_secs(30),
+            idle_after: (args.idle_after_days > 0).then(|| Duration::from_secs(args.idle_after_days * 86_400)),
             instance: instance.clone(),
         };
         info!(threads, shard = ?config.shard, "starting scanner");

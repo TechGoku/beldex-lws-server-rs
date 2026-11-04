@@ -14,9 +14,14 @@
 # Admin commands run inside a container:
 #   docker compose -f deploy/docker-compose.yml exec api beldex-lws admin list-accounts
 #   docker compose -f deploy/docker-compose.yml exec api beldex-lws doctor
+#
+# Backup (the database; back up the `keys` volume as well):
+#   docker compose -f deploy/docker-compose.yml exec -T db pg_dump -U lws -Fc beldex_lws > beldex-lws.dump
 
 x-lws: &lws
-  image: beldex-lws
+  # Set LWS_IMAGE=ghcr.io/techgoku/beldex-lws:latest in .env and run
+  # `docker compose pull` to use the published image instead of building.
+  image: ${LWS_IMAGE:-beldex-lws}
   build: { context: .., dockerfile: deploy/Dockerfile }
   environment:
     LWS_NETWORK: ${LWS_NETWORK:-main}
@@ -26,6 +31,7 @@ x-lws: &lws
     LWS_SEALING_KEY_FILE: /var/lib/beldex-lws/keys/beldex-lws-seal.key
     LWS_ADMIN_TOKEN_FILE: /var/lib/beldex-lws/keys/beldex-lws-admin.token
     LWS_ACCOUNT_CREATION: ${LWS_ACCOUNT_CREATION:-auto}
+    LWS_IDLE_AFTER_DAYS: ${LWS_IDLE_AFTER_DAYS:-0}
   volumes: [keys:/var/lib/beldex-lws/keys]
   extra_hosts: ["host.docker.internal:host-gateway"]
   restart: unless-stopped

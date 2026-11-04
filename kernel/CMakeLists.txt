@@ -16,6 +16,10 @@ pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium>=1.0.18)
 
 set(BELDEX_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../external/beldex" CACHE PATH "beldex core checkout")
 set(BELDEX_BINARY_DIR "${CMAKE_BINARY_DIR}/beldex-core")
+# beldex core defaults to -march=native, which makes a release archive, Docker
+# image or CI cache crash on any CPU older than the build machine's. `native`
+# is for a build that only ever runs where it was compiled (make NATIVE=1).
+set(LWS_ARCH "default" CACHE STRING "CPU to compile beldex core for: default or native")
 
 # Static libraries the kernel needs, in link order, relative to the beldex build.
 set(BELDEX_LIBS
@@ -43,9 +47,7 @@ ExternalProject_Add(beldex_core
     -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
     -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-    # beldex core defaults to -march=native, which makes a release archive,
-    # Docker image or CI cache crash on any CPU older than the build machine's.
-    -DARCH=default
+    -DARCH=${LWS_ARCH}
     -DBUILD_TESTS=OFF
     -DBUILD_DOCUMENTATION=OFF
     -DUSE_READLINE=OFF

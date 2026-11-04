@@ -120,7 +120,45 @@ async fn accounts_create_once() {
         assert!(store.account_by_address("nope").await.unwrap().is_none());
 
         assert_eq!(store.set_status(&["address-1".into()], AccountStatus::Hidden).await.unwrap(), vec!["address-1"]);
-        assert!(store.scan_targets(None).await.unwrap().is_empty());
+        assert!(store.scan_targets(None, None).await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn sqlite_backup_is_a_working_copy() {
+    for store in backends().await {
+        let a = created(&store, 1, 50).await;
+        let path = std::env::temp_dir().join(format!("lws-backup-test-{}-{}.db", std::process::id(), store.backend()));
+        let _ = std::fs::remove_file(&path);
+        if !store.sqlite_backup(&path.display().to_string()).await.unwrap() {
+            assert_eq!(store.backend(), "postgres");
+            continue;
+        }
+        let copy =
+            Store::connect(&format!("sqlite:{}", path.display()), 1, Sealer::new((1, &[42; 32]), &[])).await.unwrap();
+        let restored = copy.account_by_address("address-1").await.unwrap().unwrap();
+        assert_eq!((restored.id, restored.view_key.clone()), (a.id, a.view_key.clone()));
+        copy.close().await;
+        // The target must be new: a backup never overwrites a database.
+        assert!(store.sqlite_backup(&path.display().to_string()).await.is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[tokio::test]
+async fn idle_accounts_are_not_scanned_until_used() {
+    for store in backends().await {
+        let a = created(&store, 1, 50).await;
+        let b = created(&store, 2, 50).await;
+        let now = lws_core::now_secs();
+        let ids = |v: Vec<Account>| v.into_iter().map(|a| a.id).collect::<Vec<_>>();
+        assert_eq!(ids(store.scan_targets(None, None).await.unwrap()), vec![a.id, b.id]);
+        // Both were created just now, so neither is idle yet.
+        assert_eq!(ids(store.scan_targets(None, Some(now - 60)).await.unwrap()), vec![a.id, b.id]);
+        assert!(store.scan_targets(None, Some(now + 3600)).await.unwrap().is_empty());
+        // A wallet using b brings it back.
+        store.touch(b.id, now + 7200).await.unwrap();
+        assert_eq!(ids(store.scan_targets(None, Some(now + 3600)).await.unwrap()), vec![b.id]);
     }
 }
 

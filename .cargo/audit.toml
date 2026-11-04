@@ -1,0 +1,5 @@
+[advisories]
+# rsa (Marvin attack, no fixed release) is in Cargo.lock only because sqlx's
+# macros list sqlx-mysql; this workspace builds sqlx for postgres and sqlite
+# only, so neither crate is compiled (`cargo tree -i rsa --target all` is empty).
+ignore = ["RUSTSEC-2023-0071"]

@@ -330,6 +330,11 @@ pub struct ServeArgs {
     /// Seconds between polls at the chain tip.
     #[arg(long, env = "LWS_POLL_INTERVAL", default_value_t = 5)]
     pub poll_interval: u64,
+    /// Stop scanning accounts no wallet has opened for this many days (0 =
+    /// never). An idle account resumes, and catches up, as soon as a wallet
+    /// opens it again; until then its balance is not kept current.
+    #[arg(long, env = "LWS_IDLE_AFTER_DAYS", default_value_t = 0)]
+    pub idle_after_days: u64,
     /// Run every account through the C++ kernel instead of screening with
     /// the fast prefilter first (slower; for diagnosis).
     #[arg(long, env = "LWS_NO_FAST_SCAN", value_parser = BoolishValueParser::new())]

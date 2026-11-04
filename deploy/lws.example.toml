@@ -29,4 +29,5 @@ max-in-flight = 4096
 
 # scan-shard = "0/2"                           # this process scans ids % 2 == 0
 scan-lanes = 4
+idle-after-days = 0                            # stop scanning wallets unused this long (0 = never)
 log-format = "json"
